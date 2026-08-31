@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/binary"
-	"io"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -81,11 +80,4 @@ func parseUint32(in []byte) (uint32, []byte, bool) {
 		return 0, nil, false
 	}
 	return binary.BigEndian.Uint32(in), in[4:], true
-}
-
-func closeQuietly(c io.Closer) {
-	if c == nil {
-		return
-	}
-	_ = c.Close()
 }

@@ -3,18 +3,23 @@ package ssh
 import (
 	"context"
 	"errors"
-	"fmt"
 	"maps"
 	"net"
 	"sync"
 	"time"
 
+	"github.com/echocat/slf4g"
+	"github.com/echocat/slf4g/names"
 	gossh "golang.org/x/crypto/ssh"
 )
 
-// ErrServerClosed is returned by [Server.Serve] and [Server.ListenAndServe]
-// after a call to [Server.Shutdown] or [Server.Close].
-var ErrServerClosed = errors.New("ssh: Server closed")
+var (
+	// ErrServerClosed is returned by [Server.Serve] and [Server.ListenAndServe]
+	// after a call to [Server.Shutdown] or [Server.Close].
+	ErrServerClosed = errors.New("ssh: Server closed")
+
+	ErrServerPermissionDenied = errors.New("permission denied")
+)
 
 type SubsystemHandler func(s Session)
 
@@ -34,11 +39,16 @@ var DefaultChannelHandlers = map[string]ChannelHandler{
 // Server is a valid configuration. When both PasswordHandler and
 // PublicKeyHandler are nil, no client authentication is performed.
 type Server struct {
-	Addr        string   // TCP address to listen on, ":22" if empty
-	Handler     Handler  // handler to invoke, ssh.DefaultHandler if nil
-	HostSigners []Signer // private keys for the host key, must have at least one
-	Version     string   // server version to be sent before the initial handshake
-	Banner      string   // server banner
+	Logger log.Logger
+
+	Addr                   string                 // TCP address to listen on, ":22" if empty
+	Handler                Handler                // handler to invoke, ssh.DefaultHandler if nil
+	HostSigners            []Signer               // private keys for the host key, must have at least one
+	Version                string                 // server version to be sent before the initial handshake
+	Banner                 string                 // server banner
+	Ciphers                Ciphers                // allowed ciphers, DefaultCiphers if empty
+	KeyExchanges           KeyExchanges           // allowed key exchanges, DefaultKeyExchanges if empty
+	MessageAuthentications MessageAuthentications // allowed MACs, DefaultMessageAuthentications if empty
 
 	BannerHandler                 BannerHandler                 // server banner handler, overrides Banner
 	KeyboardInteractiveHandler    KeyboardInteractiveHandler    // keyboard-interactive authentication handler
@@ -127,6 +137,36 @@ func (srv *Server) config(ctx Context) *gossh.ServerConfig {
 	} else {
 		config = srv.ServerConfigCallback(ctx)
 	}
+	if !srv.Ciphers.IsEmpty() || len(config.Ciphers) == 0 {
+		ciphers := srv.Ciphers
+		if ciphers.IsEmpty() {
+			ciphers = DefaultCiphers
+		}
+		config.Ciphers = make([]string, len(ciphers))
+		for i, cipher := range ciphers {
+			config.Ciphers[i] = cipher.String()
+		}
+	}
+	if !srv.KeyExchanges.IsEmpty() || len(config.KeyExchanges) == 0 {
+		keyExchanges := srv.KeyExchanges
+		if keyExchanges.IsEmpty() {
+			keyExchanges = DefaultKeyExchanges
+		}
+		config.KeyExchanges = make([]string, len(keyExchanges))
+		for i, keyExchange := range keyExchanges {
+			config.KeyExchanges[i] = keyExchange.String()
+		}
+	}
+	if !srv.MessageAuthentications.IsEmpty() || len(config.MACs) == 0 {
+		messageAuthentications := srv.MessageAuthentications
+		if messageAuthentications.IsEmpty() {
+			messageAuthentications = DefaultMessageAuthentications
+		}
+		config.MACs = make([]string, len(messageAuthentications))
+		for i, messageAuthentication := range messageAuthentications {
+			config.MACs[i] = messageAuthentication.String()
+		}
+	}
 	for _, signer := range srv.HostSigners {
 		config.AddHostKey(signer)
 	}
@@ -151,7 +191,7 @@ func (srv *Server) config(ctx Context) *gossh.ServerConfig {
 		config.PasswordCallback = func(conn gossh.ConnMetadata, password []byte) (*gossh.Permissions, error) {
 			applyConnMetadata(ctx, conn)
 			if ok := srv.PasswordHandler(ctx, string(password)); !ok {
-				return ctx.Permissions().Permissions, fmt.Errorf("permission denied")
+				return ctx.Permissions().Permissions, ErrServerPermissionDenied
 			}
 			return ctx.Permissions().Permissions, nil
 		}
@@ -160,7 +200,7 @@ func (srv *Server) config(ctx Context) *gossh.ServerConfig {
 		config.PublicKeyCallback = func(conn gossh.ConnMetadata, key gossh.PublicKey) (*gossh.Permissions, error) {
 			applyConnMetadata(ctx, conn)
 			if ok := srv.PublicKeyHandler(ctx, key); !ok {
-				return ctx.Permissions().Permissions, fmt.Errorf("permission denied")
+				return ctx.Permissions().Permissions, ErrServerPermissionDenied
 			}
 			ctx.SetValue(ContextKeyPublicKey, key)
 			return ctx.Permissions().Permissions, nil
@@ -170,7 +210,7 @@ func (srv *Server) config(ctx Context) *gossh.ServerConfig {
 		config.KeyboardInteractiveCallback = func(conn gossh.ConnMetadata, challenger gossh.KeyboardInteractiveChallenge) (*gossh.Permissions, error) {
 			applyConnMetadata(ctx, conn)
 			if ok := srv.KeyboardInteractiveHandler(ctx, challenger); !ok {
-				return ctx.Permissions().Permissions, fmt.Errorf("permission denied")
+				return ctx.Permissions().Permissions, ErrServerPermissionDenied
 			}
 			return ctx.Permissions().Permissions, nil
 		}
@@ -471,3 +511,14 @@ func (srv *Server) trackConn(c *gossh.ServerConn, add bool) {
 		srv.connWg.Done()
 	}
 }
+
+func (srv *Server) logger() log.Logger {
+	if v := srv.Logger; v != nil {
+		return v
+	}
+	return defaultServerLoggerGetter()
+}
+
+var defaultServerLoggerGetter = sync.OnceValue[log.Logger](func() log.Logger {
+	return log.GetLogger(names.CurrentPackageLoggerNameGenerator(0) + ".server")
+})

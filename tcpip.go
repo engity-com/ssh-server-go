@@ -1,12 +1,12 @@
 package ssh
 
 import (
-	"io"
-	"log"
 	"net"
 	"strconv"
 	"sync"
 
+	"github.com/echocat/slf4g"
+	"github.com/echocat/slf4g/names"
 	gossh "golang.org/x/crypto/ssh"
 )
 
@@ -25,7 +25,7 @@ type localForwardChannelData struct {
 
 // DirectTCPIPHandler can be enabled by adding it to the server's
 // ChannelHandlers under direct-tcpip.
-func DirectTCPIPHandler(srv *Server, _ *gossh.ServerConn, newChan gossh.NewChannel, ctx Context) {
+func DirectTCPIPHandler(srv *Server, sshConn *gossh.ServerConn, newChan gossh.NewChannel, ctx Context) {
 	d := localForwardChannelData{}
 	if err := gossh.Unmarshal(newChan.ExtraData(), &d); err != nil {
 		_ = newChan.Reject(gossh.ConnectionFailed, "error parsing forward data: "+err.Error())
@@ -52,17 +52,15 @@ func DirectTCPIPHandler(srv *Server, _ *gossh.ServerConn, newChan gossh.NewChann
 		return
 	}
 	go gossh.DiscardRequests(reqs)
-
-	go func() {
-		defer closeQuietly(ch)
-		defer closeQuietly(conn)
-		_, _ = io.Copy(ch, conn)
-	}()
-	go func() {
-		defer closeQuietly(ch)
-		defer closeQuietly(conn)
-		_, _ = io.Copy(conn, ch)
-	}()
+	defer closeQuietly(ch)
+	defer closeQuietly(conn)
+	if err := FullDuplexCopy(ctx, conn, ch, nil); err != nil {
+		enrichLoggerForServerConnection(srv.logger(), sshConn).
+			WithError(err).
+			With("tcp.remote", conn.RemoteAddr()).
+			With("tcp.local", conn.LocalAddr()).
+			Warn("'direct-tcpip': failed to forward connection")
+	}
 }
 
 type remoteForwardRequest struct {
@@ -90,6 +88,8 @@ type remoteForwardChannelData struct {
 // adding the HandleSSHRequest callback to the server's RequestHandlers under
 // tcpip-forward and cancel-tcpip-forward.
 type ForwardedTCPHandler struct {
+	Logger log.Logger
+
 	forwards map[string]net.Listener
 	sync.Mutex
 }
@@ -105,7 +105,9 @@ func (h *ForwardedTCPHandler) HandleSSHRequest(ctx Context, srv *Server, req *go
 	case "tcpip-forward":
 		var reqPayload remoteForwardRequest
 		if err := gossh.Unmarshal(req.Payload, &reqPayload); err != nil {
-			// TODO: log parse failure
+			h.loggerOfConnection(conn).
+				WithError(err).
+				Warn("'tcpip-forward': cannot parse request")
 			return false, []byte{}
 		}
 		if srv.ReversePortForwardingCallback == nil || !srv.ReversePortForwardingCallback(ctx, reqPayload.BindAddr, reqPayload.BindPort) {
@@ -114,7 +116,11 @@ func (h *ForwardedTCPHandler) HandleSSHRequest(ctx Context, srv *Server, req *go
 		addr := net.JoinHostPort(reqPayload.BindAddr, strconv.Itoa(int(reqPayload.BindPort)))
 		ln, err := net.Listen("tcp", addr)
 		if err != nil {
-			// TODO: log listen failure
+			h.loggerOfConnection(conn).
+				WithError(err).
+				With("bind.addr", reqPayload.BindAddr).
+				With("bind.port", reqPayload.BindPort).
+				Warn("'tcpip-forward': cannot listen to requested bind address/port")
 			return false, []byte{}
 		}
 		_, destPortStr, _ := net.SplitHostPort(ln.Addr().String())
@@ -146,26 +152,27 @@ func (h *ForwardedTCPHandler) HandleSSHRequest(ctx Context, srv *Server, req *go
 					OriginAddr: originAddr,
 					OriginPort: uint32(originPort),
 				})
-				go func() {
+				go func(c net.Conn, payload []byte) {
+					defer closeQuietly(c)
 					ch, reqs, err := conn.OpenChannel(forwardedTCPChannelType, payload)
 					if err != nil {
-						// TODO: log failure to open channel
-						log.Println(err)
-						closeQuietly(c)
+						h.loggerOfConnection(conn).
+							WithError(err).
+							With("tcp.remote", c.RemoteAddr()).
+							With("tcp.local", c.LocalAddr()).
+							Error("'tcpip-forward': cannot open channel of accepted connection, will close connection now...")
 						return
 					}
+					defer closeQuietly(ch)
 					go gossh.DiscardRequests(reqs)
-					go func() {
-						defer closeQuietly(ch)
-						defer closeQuietly(c)
-						_, _ = io.Copy(ch, c)
-					}()
-					go func() {
-						defer closeQuietly(ch)
-						defer closeQuietly(c)
-						_, _ = io.Copy(c, ch)
-					}()
-				}()
+					if err := FullDuplexCopy(ctx, c, ch, nil); err != nil {
+						h.loggerOfConnection(conn).
+							WithError(err).
+							With("tcp.remote", c.RemoteAddr()).
+							With("tcp.local", c.LocalAddr()).
+							Warn("'tcpip-forward': failed to forward connection")
+					}
+				}(c, payload)
 			}
 			h.Lock()
 			delete(h.forwards, addr)
@@ -176,7 +183,9 @@ func (h *ForwardedTCPHandler) HandleSSHRequest(ctx Context, srv *Server, req *go
 	case "cancel-tcpip-forward":
 		var reqPayload remoteForwardCancelRequest
 		if err := gossh.Unmarshal(req.Payload, &reqPayload); err != nil {
-			// TODO: log parse failure
+			h.loggerOfConnection(conn).
+				WithError(err).
+				Warn("'cancel-tcpip-forward': cannot parse payload channel")
 			return false, []byte{}
 		}
 		addr := net.JoinHostPort(reqPayload.BindAddr, strconv.Itoa(int(reqPayload.BindPort)))
@@ -191,3 +200,18 @@ func (h *ForwardedTCPHandler) HandleSSHRequest(ctx Context, srv *Server, req *go
 		return false, nil
 	}
 }
+
+func (h *ForwardedTCPHandler) logger() log.Logger {
+	if v := h.Logger; v != nil {
+		return v
+	}
+	return defaultForwardedTCPHandlerLoggerGetter()
+}
+
+func (h *ForwardedTCPHandler) loggerOfConnection(conn *gossh.ServerConn) log.Logger {
+	return enrichLoggerForServerConnection(h.logger(), conn)
+}
+
+var defaultForwardedTCPHandlerLoggerGetter = sync.OnceValue[log.Logger](func() log.Logger {
+	return log.GetLogger(names.CurrentPackageLoggerNameGenerator(0) + ".tcpForward")
+})

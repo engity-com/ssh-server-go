@@ -8,6 +8,8 @@ import (
 	"sync"
 
 	"github.com/anmitsu/go-shlex"
+	"github.com/echocat/slf4g"
+	"github.com/echocat/slf4g/names"
 	gossh "golang.org/x/crypto/ssh"
 )
 
@@ -91,7 +93,9 @@ const maxSigBufSize = 128
 func DefaultSessionHandler(srv *Server, conn *gossh.ServerConn, newChan gossh.NewChannel, ctx Context) {
 	ch, reqs, err := newChan.Accept()
 	if err != nil {
-		// TODO: trigger event callback
+		enrichLoggerForServerConnection(srv.logger(), conn).
+			WithError(err).
+			Warn("failed to accept new channel")
 		return
 	}
 	sess := &session{
@@ -102,6 +106,7 @@ func DefaultSessionHandler(srv *Server, conn *gossh.ServerConn, newChan gossh.Ne
 		sessReqCb:         srv.SessionRequestCallback,
 		subsystemHandlers: srv.SubsystemHandlers,
 		ctx:               ctx,
+		logger:            srv.Logger,
 	}
 	sess.handleRequests(reqs)
 }
@@ -125,6 +130,7 @@ type session struct {
 	sigCh             chan<- Signal
 	sigBuf            []Signal
 	breakCh           chan<- bool
+	logger            log.Logger
 }
 
 func (sess *session) Write(p []byte) (n int, err error) {
@@ -381,8 +387,22 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 			_ = req.Reply(ok, nil)
 			sess.Unlock()
 		default:
-			// TODO: debug log
+			sess.getLogger().
+				With("request", req.Type).
+				Warn("unknown request")
 			_ = req.Reply(false, nil)
 		}
 	}
 }
+
+func (sess *session) getLogger() log.Logger {
+	v := sess.logger
+	if v == nil {
+		v = defaultSessionLoggerGetter()
+	}
+	return enrichLoggerForServerConnection(v, sess.conn)
+}
+
+var defaultSessionLoggerGetter = sync.OnceValue[log.Logger](func() log.Logger {
+	return log.GetLogger(names.CurrentPackageLoggerNameGenerator(0) + ".session")
+})

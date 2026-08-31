@@ -8,6 +8,9 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
+	gossh "golang.org/x/crypto/ssh"
 )
 
 func TestAddHostKey(t *testing.T) {
@@ -28,6 +31,68 @@ func TestAddHostKey(t *testing.T) {
 	if len(s.HostSigners) != 1 {
 		t.Fatal("Key was not properly replaced")
 	}
+}
+
+func TestServerConfigUsesAlgorithmDefaults(t *testing.T) {
+	ctx, cancel := newContext(nil)
+	defer cancel()
+
+	config := (&Server{}).config(ctx)
+	require.Equal(t, algorithmNames(DefaultCiphers), config.Ciphers)
+	require.Equal(t, algorithmNames(DefaultKeyExchanges), config.KeyExchanges)
+	require.Equal(t, algorithmNames(DefaultMessageAuthentications), config.MACs)
+}
+
+func TestServerConfigUsesConfiguredAlgorithms(t *testing.T) {
+	ctx, cancel := newContext(nil)
+	defer cancel()
+	srv := &Server{
+		Ciphers:                Ciphers{CipherChacha20Poly1305},
+		KeyExchanges:           KeyExchanges{KeyExchangeMlkem768x25519xSha256},
+		MessageAuthentications: MessageAuthentications{MessageAuthenticationHmacSha2B512Etm},
+		ServerConfigCallback: func(Context) *gossh.ServerConfig {
+			return &gossh.ServerConfig{
+				Config: gossh.Config{
+					Ciphers:      []string{CipherAes128Ctr.String()},
+					KeyExchanges: []string{KeyExchangeEcdh256.String()},
+					MACs:         []string{MessageAuthenticationHmacSha2B256.String()},
+				},
+			}
+		},
+	}
+
+	config := srv.config(ctx)
+	require.Equal(t, []string{CipherChacha20Poly1305.String()}, config.Ciphers)
+	require.Equal(t, []string{KeyExchangeMlkem768x25519xSha256.String()}, config.KeyExchanges)
+	require.Equal(t, []string{MessageAuthenticationHmacSha2B512Etm.String()}, config.MACs)
+}
+
+func TestServerConfigPreservesCallbackAlgorithms(t *testing.T) {
+	ctx, cancel := newContext(nil)
+	defer cancel()
+	expected := gossh.Config{
+		Ciphers:      []string{CipherAes128Ctr.String()},
+		KeyExchanges: []string{KeyExchangeEcdh256.String()},
+		MACs:         []string{MessageAuthenticationHmacSha2B256.String()},
+	}
+	srv := &Server{
+		ServerConfigCallback: func(Context) *gossh.ServerConfig {
+			return &gossh.ServerConfig{Config: expected}
+		},
+	}
+
+	config := srv.config(ctx)
+	require.Equal(t, expected.Ciphers, config.Ciphers)
+	require.Equal(t, expected.KeyExchanges, config.KeyExchanges)
+	require.Equal(t, expected.MACs, config.MACs)
+}
+
+func algorithmNames[T interface{ String() string }](algorithms []T) []string {
+	result := make([]string, len(algorithms))
+	for i, algorithm := range algorithms {
+		result[i] = algorithm.String()
+	}
+	return result
 }
 
 func TestServerShutdown(t *testing.T) {

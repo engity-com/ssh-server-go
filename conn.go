@@ -2,9 +2,14 @@ package ssh
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"net"
 	"time"
+
+	"github.com/echocat/slf4g"
+	"github.com/echocat/slf4g/fields"
+	gossh "golang.org/x/crypto/ssh"
 )
 
 type serverConn struct {
@@ -61,4 +66,29 @@ func (c *serverConn) updateDeadline() {
 	}
 
 	_ = c.Conn.SetDeadline(deadline)
+}
+
+func enrichLoggerForServerConnection(in log.Logger, conn *gossh.ServerConn) log.Logger {
+	if conn == nil {
+		return in
+	}
+	return in.
+		With("ssh.remote", fields.LazyFunc(func() any {
+			return conn.RemoteAddr()
+		})).
+		With("ssh.local", fields.LazyFunc(func() any {
+			return conn.LocalAddr()
+		})).
+		With("ssh.user", fields.LazyFunc(func() any {
+			if v := conn.User(); v != "" {
+				return v
+			}
+			return fields.Exclude
+		})).
+		With("ssh.sessionId", fields.LazyFunc(func() any {
+			if v := conn.SessionID(); len(v) > 0 {
+				return base64.URLEncoding.EncodeToString(v)
+			}
+			return fields.Exclude
+		}))
 }

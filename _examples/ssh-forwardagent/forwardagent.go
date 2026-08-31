@@ -17,7 +17,7 @@ func main() {
 				log.Fatal(err)
 			}
 			defer l.Close()
-			go ssh.ForwardAgentConnections(l, s)
+			go ssh.ForwardAgentConnections(l, nil, s)
 			cmd.Env = append(s.Environ(), fmt.Sprintf("%s=%s", "SSH_AUTH_SOCK", l.Addr().String()))
 		} else {
 			cmd.Env = s.Environ()

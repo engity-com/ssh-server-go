@@ -9,9 +9,10 @@ This Go package wraps the [crypto/ssh package](https://godoc.org/golang.org/x/cr
  package main
 
  import (
-     "github.com/engity-com/ssh-server-go"
      "io"
      "log"
+
+     "github.com/engity-com/ssh-server-go"
  )
 
  func main() {

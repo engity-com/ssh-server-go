@@ -1,12 +1,13 @@
 package ssh
 
 import (
-	"io"
 	"net"
 	"os"
 	"path"
 	"sync"
 
+	"github.com/echocat/slf4g"
+	"github.com/echocat/slf4g/names"
 	gossh "golang.org/x/crypto/ssh"
 )
 
@@ -50,34 +51,41 @@ func NewAgentListener() (net.Listener, error) {
 // ForwardAgentConnections takes connections from a listener to proxy into the
 // session on the OpenSSH channel for agent connections. It blocks and services
 // connections until the listener stop accepting.
-func ForwardAgentConnections(l net.Listener, s Session) {
-	sshConn := s.Context().Value(ContextKeyConn).(gossh.Conn)
+func ForwardAgentConnections(ln net.Listener, logger log.Logger, sess Session) {
+	if logger == nil {
+		logger = defaultForwardAgentConnectionsLoggerGetter()
+	}
+	ctx := sess.Context()
+	sshConn := ctx.Value(ContextKeyConn).(gossh.Conn)
 	for {
-		conn, err := l.Accept()
+		conn, err := ln.Accept()
+		if isClosedError(err) {
+			return
+		}
 		if err != nil {
+			logger.WithError(err).
+				Warnf("failed to listen for %s channel connections; closing...", agentChannelType)
 			return
 		}
 		go func(conn net.Conn) {
 			defer closeQuietly(conn)
 			channel, reqs, err := sshConn.OpenChannel(agentChannelType, nil)
 			if err != nil {
+				logger.WithError(err).
+					Warnf("failed to open %s channel; rejecting...", agentChannelType)
 				return
 			}
 			defer closeQuietly(channel)
 			go gossh.DiscardRequests(reqs)
-			var wg sync.WaitGroup
-			wg.Add(2)
-			go func() {
-				defer wg.Done()
-				_, _ = io.Copy(conn, channel)
-				_ = conn.(*net.UnixConn).CloseWrite()
-			}()
-			go func() {
-				defer wg.Done()
-				_, _ = io.Copy(channel, conn)
-				_ = channel.CloseWrite()
-			}()
-			wg.Wait()
+			if err := FullDuplexCopy(ctx, conn, channel, &FullDuplexCopyOpts{}); err != nil {
+				logger.WithError(err).
+					Warnf("failed to handle %s requests; closing...", agentChannelType)
+				return
+			}
 		}(conn)
 	}
 }
+
+var defaultForwardAgentConnectionsLoggerGetter = sync.OnceValue[log.Logger](func() log.Logger {
+	return log.GetLogger(names.CurrentPackageLoggerNameGenerator(0) + ".agent")
+})
