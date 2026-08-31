@@ -21,7 +21,9 @@ func sampleSocketServer() net.Listener {
 		if err != nil {
 			return
 		}
-		conn.Write(sampleServerResponse)
+		if _, err := conn.Write(sampleServerResponse); err != nil {
+			return
+		}
 		conn.Close()
 	}()
 

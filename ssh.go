@@ -125,5 +125,5 @@ func KeysEqual(ak, bk PublicKey) bool {
 
 	a := ak.Marshal()
 	b := bk.Marshal()
-	return (len(a) == len(b) && subtle.ConstantTimeCompare(a, b) == 1)
+	return len(a) == len(b) && subtle.ConstantTimeCompare(a, b) == 1
 }

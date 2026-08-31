@@ -68,14 +68,14 @@ func ForwardAgentConnections(l net.Listener, s Session) {
 			var wg sync.WaitGroup
 			wg.Add(2)
 			go func() {
-				io.Copy(conn, channel)
-				conn.(*net.UnixConn).CloseWrite()
-				wg.Done()
+				defer wg.Done()
+				_, _ = io.Copy(conn, channel)
+				_ = conn.(*net.UnixConn).CloseWrite()
 			}()
 			go func() {
-				io.Copy(channel, conn)
-				channel.CloseWrite()
-				wg.Done()
+				defer wg.Done()
+				_, _ = io.Copy(channel, conn)
+				_ = channel.CloseWrite()
 			}()
 			wg.Wait()
 		}(conn)

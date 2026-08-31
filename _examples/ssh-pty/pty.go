@@ -9,8 +9,7 @@ import (
 	"syscall"
 	"unsafe"
 
-	"github.com/gliderlabs/ssh"
-	"github.com/creack/pty"
+	"github.com/engity-com/ssh-server-go"
 )
 
 func setWinsize(f *os.File, w, h int) {

@@ -1,0 +1,46 @@
+name: "🚀 Feature request"
+description: Suggest an idea for this project
+title: "[FEATURE] "
+labels: ["feature_request", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Would you like to help us improve SSH Server SDK for Go? That would be great! 🙂
+
+  - type: textarea
+    id: problem-relation
+    attributes:
+      label: Is your feature request related to a problem?
+      description: A clear and concise description of what the problem is.
+      placeholder: Ex. I'm always frustrated when [...]
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Describe the solution you'd like.
+      description: A clear and concise description of what you want to happen.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Describe alternatives you've considered
+      description: A clear and concise description of any alternative solutions or features you've considered.
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Additional context
+      description: Add any other context or screenshots about the feature request here.
+    validations:
+      required: false
+
+  - type: markdown
+    attributes:
+      value: Thank you for your contribution. 🙏

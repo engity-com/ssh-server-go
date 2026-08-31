@@ -65,7 +65,11 @@ func newClientSession(t *testing.T, addr string, config *gossh.ClientConfig) (*g
 
 func newTestSession(t *testing.T, srv *Server, cfg *gossh.ClientConfig) (*gossh.Session, *gossh.Client, func()) {
 	l := newLocalListener()
-	go srv.serveOnce(l)
+	go func() {
+		if err := srv.serveOnce(l); err != nil {
+			t.Error(err)
+		}
+	}()
 	return newClientSession(t, l.Addr().String(), cfg)
 }
 
@@ -74,7 +78,9 @@ func TestStdout(t *testing.T) {
 	testBytes := []byte("Hello world\n")
 	session, _, cleanup := newTestSession(t, &Server{
 		Handler: func(s Session) {
-			s.Write(testBytes)
+			if _, err := s.Write(testBytes); err != nil {
+				t.Error(err)
+			}
 		},
 	}, nil)
 	defer cleanup()
@@ -93,7 +99,9 @@ func TestStderr(t *testing.T) {
 	testBytes := []byte("Hello world\n")
 	session, _, cleanup := newTestSession(t, &Server{
 		Handler: func(s Session) {
-			s.Stderr().Write(testBytes)
+			if _, err := s.Stderr().Write(testBytes); err != nil {
+				t.Error(err)
+			}
 		},
 	}, nil)
 	defer cleanup()
@@ -112,7 +120,7 @@ func TestStdin(t *testing.T) {
 	testBytes := []byte("Hello world\n")
 	session, _, cleanup := newTestSession(t, &Server{
 		Handler: func(s Session) {
-			io.Copy(s, s) // stdin back into stdout
+			_, _ = io.Copy(s, s) // stdin back into stdout
 		},
 	}, nil)
 	defer cleanup()
@@ -132,7 +140,9 @@ func TestUser(t *testing.T) {
 	testUser := []byte("progrium")
 	session, _, cleanup := newTestSession(t, &Server{
 		Handler: func(s Session) {
-			io.WriteString(s, s.User())
+			if _, err := io.WriteString(s, s.User()); err != nil {
+				t.Error(err)
+			}
 		},
 	}, &gossh.ClientConfig{
 		User: string(testUser),
@@ -166,7 +176,9 @@ func TestExplicitExitStatusZero(t *testing.T) {
 	t.Parallel()
 	session, _, cleanup := newTestSession(t, &Server{
 		Handler: func(s Session) {
-			s.Exit(0)
+			if err := s.Exit(0); err != nil {
+				t.Error(err)
+			}
 		},
 	}, nil)
 	defer cleanup()
@@ -180,7 +192,9 @@ func TestExitStatusNonZero(t *testing.T) {
 	t.Parallel()
 	session, _, cleanup := newTestSession(t, &Server{
 		Handler: func(s Session) {
-			s.Exit(1)
+			if err := s.Exit(1); err != nil {
+				t.Error(err)
+			}
 		},
 	}, nil)
 	defer cleanup()
@@ -328,8 +342,13 @@ func TestSignals(t *testing.T) {
 	defer cleanup()
 
 	go func() {
-		session.Signal(gossh.SIGINT)
-		session.Signal(gossh.SIGKILL)
+		if err := session.Signal(gossh.SIGINT); err != nil {
+			errChan <- err
+			return
+		}
+		if err := session.Signal(gossh.SIGKILL); err != nil {
+			errChan <- err
+		}
 	}()
 
 	go func() {
@@ -364,7 +383,10 @@ func TestBreakWithChanRegistered(t *testing.T) {
 
 			select {
 			case <-breakChan:
-				io.WriteString(s, "break")
+				if _, err := io.WriteString(s, "break"); err != nil {
+					errChan <- err
+					return
+				}
 			case <-doneChan:
 				errChan <- fmt.Errorf("Unexpected done")
 				return

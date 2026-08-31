@@ -34,14 +34,16 @@ func TestServerShutdown(t *testing.T) {
 	testBytes := []byte("Hello world\n")
 	s := &Server{
 		Handler: func(s Session) {
-			s.Write(testBytes)
+			if _, err := s.Write(testBytes); err != nil {
+				t.Error(err)
+			}
 			time.Sleep(50 * time.Millisecond)
 		},
 	}
 	go func() {
 		err := s.Serve(l)
 		if err != nil && err != ErrServerClosed {
-			t.Fatal(err)
+			t.Error(err)
 		}
 	}()
 	sessDone := make(chan struct{})
@@ -52,10 +54,10 @@ func TestServerShutdown(t *testing.T) {
 		var stdout bytes.Buffer
 		sess.Stdout = &stdout
 		if err := sess.Run(""); err != nil {
-			t.Fatal(err)
+			t.Error(err)
 		}
 		if !bytes.Equal(stdout.Bytes(), testBytes) {
-			t.Fatalf("expected = %s; got %s", testBytes, stdout.Bytes())
+			t.Errorf("expected = %s; got %s", testBytes, stdout.Bytes())
 		}
 	}()
 
@@ -64,7 +66,7 @@ func TestServerShutdown(t *testing.T) {
 		defer close(srvDone)
 		err := s.Shutdown(context.Background())
 		if err != nil {
-			t.Fatal(err)
+			t.Error(err)
 		}
 	}()
 
@@ -90,7 +92,7 @@ func TestServerClose(t *testing.T) {
 	go func() {
 		err := s.Serve(l)
 		if err != nil && err != ErrServerClosed {
-			t.Fatal(err)
+			t.Error(err)
 		}
 	}()
 
@@ -103,14 +105,14 @@ func TestServerClose(t *testing.T) {
 		defer close(clientDoneChan)
 		<-closeDoneChan
 		if err := sess.Run(""); err != nil && err != io.EOF {
-			t.Fatal(err)
+			t.Error(err)
 		}
 	}()
 
 	go func() {
 		err := s.Close()
 		if err != nil {
-			t.Fatal(err)
+			t.Error(err)
 		}
 		close(closeDoneChan)
 	}()
@@ -147,7 +149,7 @@ func TestServerHandshakeTimeout(t *testing.T) {
 	ch := make(chan struct{})
 	go func() {
 		defer close(ch)
-		io.Copy(io.Discard, conn)
+		_, _ = io.Copy(io.Discard, conn)
 	}()
 
 	select {

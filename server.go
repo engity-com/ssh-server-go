@@ -318,7 +318,7 @@ func (srv *Server) HandleConn(newConn net.Conn) {
 			handler = srv.ChannelHandlers["default"]
 		}
 		if handler == nil {
-			ch.Reject(gossh.UnknownChannelType, "unsupported channel type")
+			_ = ch.Reject(gossh.UnknownChannelType, "unsupported channel type")
 			continue
 		}
 		go handler(srv, sshConn, ch, ctx)
@@ -332,13 +332,17 @@ func (srv *Server) handleRequests(ctx Context, in <-chan *gossh.Request) {
 			handler = srv.RequestHandlers["default"]
 		}
 		if handler == nil {
-			req.Reply(false, nil)
+			if err := req.Reply(false, nil); err != nil {
+				return
+			}
 			continue
 		}
 		/*reqCtx, cancel := context.WithCancel(ctx)
 		defer cancel() */
 		ret, payload := handler(ctx, srv, req)
-		req.Reply(ret, payload)
+		if err := req.Reply(ret, payload); err != nil {
+			return
+		}
 	}
 }
 

@@ -1,0 +1,36 @@
+[tasks."install"]
+run = [
+    { task = "install:go" },
+]
+
+[tasks."install:go"]
+run = "go mod download"
+
+[tasks."lint"]
+run = [
+    { task = "lint:go" }
+]
+
+[tasks."lint:go"]
+run = "golangci-lint run --color=always"
+
+[tasks."test"]
+run = [
+    { task = "test:go" }
+]
+
+[tasks."test:go"]
+depends = ["build:var"]
+run = 'go test -v -covermode atomic -coverprofile=var/profile.cov ./...'
+
+[tasks."build:var"]
+hide = true
+silent = true
+run = "mkdir -p var"
+run_windows = 'if not exist var mkdir var'
+
+[settings]
+env_file = ".env"
+
+[tool_alias]
+golangci-lint = "aqua:golangci/golangci-lint"

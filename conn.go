@@ -59,5 +59,5 @@ func (c *serverConn) updateDeadline() {
 		}
 	}
 
-	c.Conn.SetDeadline(deadline)
+	_ = c.Conn.SetDeadline(deadline)
 }

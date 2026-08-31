@@ -51,10 +51,16 @@ func TestPasswordAuthBadPass(t *testing.T) {
 	t.Parallel()
 	l := newLocalListener()
 	srv := &Server{Handler: func(s Session) {}}
-	srv.SetOption(PasswordAuth(func(ctx Context, password string) bool {
+	if err := srv.SetOption(PasswordAuth(func(ctx Context, password string) bool {
 		return false
-	}))
-	go srv.serveOnce(l)
+	})); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		if err := srv.serveOnce(l); err != nil {
+			t.Error(err)
+		}
+	}()
 	_, err := gossh.Dial("tcp", l.Addr().String(), &gossh.ClientConfig{
 		User: "testuser",
 		Auth: []gossh.AuthMethod{
