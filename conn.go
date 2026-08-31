@@ -2,6 +2,7 @@ package ssh
 
 import (
 	"context"
+	"errors"
 	"net"
 	"time"
 )
@@ -20,7 +21,7 @@ func (c *serverConn) Write(p []byte) (n int, err error) {
 		c.updateDeadline()
 	}
 	n, err = c.Conn.Write(p)
-	if _, isNetErr := err.(net.Error); isNetErr && c.closeCanceler != nil {
+	if _, ok := errors.AsType[net.Error](err); ok && c.closeCanceler != nil {
 		c.closeCanceler()
 	}
 	return
@@ -31,7 +32,7 @@ func (c *serverConn) Read(b []byte) (n int, err error) {
 		c.updateDeadline()
 	}
 	n, err = c.Conn.Read(b)
-	if _, isNetErr := err.(net.Error); isNetErr && c.closeCanceler != nil {
+	if _, ok := errors.AsType[net.Error](err); ok && c.closeCanceler != nil {
 		c.closeCanceler()
 	}
 	return

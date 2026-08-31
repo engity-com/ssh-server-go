@@ -40,7 +40,7 @@ func DirectTCPIPHandler(srv *Server, _ *gossh.ServerConn, newChan gossh.NewChann
 	dest := net.JoinHostPort(d.DestAddr, strconv.FormatInt(int64(d.DestPort), 10))
 
 	var dialer net.Dialer
-	dconn, err := dialer.DialContext(ctx, "tcp", dest)
+	conn, err := dialer.DialContext(ctx, "tcp", dest)
 	if err != nil {
 		_ = newChan.Reject(gossh.ConnectionFailed, err.Error())
 		return
@@ -48,20 +48,20 @@ func DirectTCPIPHandler(srv *Server, _ *gossh.ServerConn, newChan gossh.NewChann
 
 	ch, reqs, err := newChan.Accept()
 	if err != nil {
-		dconn.Close()
+		closeQuietly(conn)
 		return
 	}
 	go gossh.DiscardRequests(reqs)
 
 	go func() {
-		defer ch.Close()
-		defer dconn.Close()
-		_, _ = io.Copy(ch, dconn)
+		defer closeQuietly(ch)
+		defer closeQuietly(conn)
+		_, _ = io.Copy(ch, conn)
 	}()
 	go func() {
-		defer ch.Close()
-		defer dconn.Close()
-		_, _ = io.Copy(dconn, ch)
+		defer closeQuietly(ch)
+		defer closeQuietly(conn)
+		_, _ = io.Copy(conn, ch)
 	}()
 }
 
@@ -128,7 +128,7 @@ func (h *ForwardedTCPHandler) HandleSSHRequest(ctx Context, srv *Server, req *go
 			ln, ok := h.forwards[addr]
 			h.Unlock()
 			if ok {
-				ln.Close()
+				closeQuietly(ln)
 			}
 		}()
 		go func() {
@@ -151,18 +151,18 @@ func (h *ForwardedTCPHandler) HandleSSHRequest(ctx Context, srv *Server, req *go
 					if err != nil {
 						// TODO: log failure to open channel
 						log.Println(err)
-						c.Close()
+						closeQuietly(c)
 						return
 					}
 					go gossh.DiscardRequests(reqs)
 					go func() {
-						defer ch.Close()
-						defer c.Close()
+						defer closeQuietly(ch)
+						defer closeQuietly(c)
 						_, _ = io.Copy(ch, c)
 					}()
 					go func() {
-						defer ch.Close()
-						defer c.Close()
+						defer closeQuietly(ch)
+						defer closeQuietly(c)
 						_, _ = io.Copy(c, ch)
 					}()
 				}()
@@ -184,7 +184,7 @@ func (h *ForwardedTCPHandler) HandleSSHRequest(ctx Context, srv *Server, req *go
 		ln, ok := h.forwards[addr]
 		h.Unlock()
 		if ok {
-			ln.Close()
+			closeQuietly(ln)
 		}
 		return true, nil
 	default:

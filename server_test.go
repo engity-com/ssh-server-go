@@ -3,6 +3,7 @@ package ssh
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"testing"
@@ -42,7 +43,7 @@ func TestServerShutdown(t *testing.T) {
 	}
 	go func() {
 		err := s.Serve(l)
-		if err != nil && err != ErrServerClosed {
+		if err != nil && !errors.Is(err, ErrServerClosed) {
 			t.Error(err)
 		}
 	}()
@@ -91,7 +92,7 @@ func TestServerClose(t *testing.T) {
 	}
 	go func() {
 		err := s.Serve(l)
-		if err != nil && err != ErrServerClosed {
+		if err != nil && !errors.Is(err, ErrServerClosed) {
 			t.Error(err)
 		}
 	}()
@@ -144,7 +145,7 @@ func TestServerHandshakeTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer closeQuietly(conn)
 
 	ch := make(chan struct{})
 	go func() {

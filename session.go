@@ -66,18 +66,18 @@ type Session interface {
 	Permissions() Permissions
 
 	// Pty returns PTY information, a channel of window size changes, and a boolean
-	// of whether or not a PTY was accepted for this session.
+	// of whether a PTY was accepted for this session.
 	Pty() (Pty, <-chan Window, bool)
 
 	// Signals registers a channel to receive signals sent from the client. The
-	// channel must handle signal sends or it will block the SSH request loop.
+	// channel must handle signal sends, or it will block the SSH request loop.
 	// Registering nil will unregister the channel from signal sends. During the
 	// time no channel is registered signals are buffered up to a reasonable amount.
 	// If there are buffered signals when a channel is registered, they will be
 	// sent in order on the channel immediately after registering.
 	Signals(c chan<- Signal)
 
-	// Break regisers a channel to receive notifications of break requests sent
+	// Break registers a channel to receive notifications of break requests sent
 	// from the client. The channel must handle break requests, or it will block
 	// the request handling loop. Registering nil will unregister the channel.
 	// During the time that no channel is registered, breaks are ignored.
@@ -144,11 +144,11 @@ func (sess *session) Write(p []byte) (n int, err error) {
 }
 
 func (sess *session) PublicKey() PublicKey {
-	sessionkey := sess.ctx.Value(ContextKeyPublicKey)
-	if sessionkey == nil {
+	sessionKey := sess.ctx.Value(ContextKeyPublicKey)
+	if sessionKey == nil {
 		return nil
 	}
-	return sessionkey.(PublicKey)
+	return sessionKey.(PublicKey)
 }
 
 func (sess *session) Permissions() Permissions {

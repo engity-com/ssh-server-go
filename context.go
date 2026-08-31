@@ -10,7 +10,7 @@ import (
 )
 
 // contextKey is a value for use with context.WithValue. It's used as
-// a pointer so it fits in an interface{} without allocation.
+// a pointer so it fits in an any without allocation.
 type contextKey struct {
 	name string
 }
@@ -88,20 +88,20 @@ type Context interface {
 	Permissions() *Permissions
 
 	// SetValue allows you to easily write new values into the underlying context.
-	SetValue(key, value interface{})
+	SetValue(key, value any)
 }
 
 type sshContext struct {
 	context.Context
 	*sync.Mutex
 
-	values   map[interface{}]interface{}
+	values   map[any]any
 	valuesMu sync.Mutex
 }
 
 func newContext(srv *Server) (*sshContext, context.CancelFunc) {
 	innerCtx, cancel := context.WithCancel(context.Background())
-	ctx := &sshContext{Context: innerCtx, Mutex: &sync.Mutex{}, values: make(map[interface{}]interface{})}
+	ctx := &sshContext{Context: innerCtx, Mutex: &sync.Mutex{}, values: make(map[any]any)}
 	ctx.SetValue(ContextKeyServer, srv)
 	perms := &Permissions{&gossh.Permissions{}}
 	ctx.SetValue(ContextKeyPermissions, perms)
@@ -122,7 +122,7 @@ func applyConnMetadata(ctx Context, conn gossh.ConnMetadata) {
 	ctx.SetValue(ContextKeyRemoteAddr, conn.RemoteAddr())
 }
 
-func (ctx *sshContext) Value(key interface{}) interface{} {
+func (ctx *sshContext) Value(key any) any {
 	ctx.valuesMu.Lock()
 	defer ctx.valuesMu.Unlock()
 	if v, ok := ctx.values[key]; ok {
@@ -131,7 +131,7 @@ func (ctx *sshContext) Value(key interface{}) interface{} {
 	return ctx.Context.Value(key)
 }
 
-func (ctx *sshContext) SetValue(key, value interface{}) {
+func (ctx *sshContext) SetValue(key, value any) {
 	ctx.valuesMu.Lock()
 	defer ctx.valuesMu.Unlock()
 	ctx.values[key] = value

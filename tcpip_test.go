@@ -24,7 +24,7 @@ func sampleSocketServer() net.Listener {
 		if _, err := conn.Write(sampleServerResponse); err != nil {
 			return
 		}
-		conn.Close()
+		closeQuietly(conn)
 	}()
 
 	return l
@@ -46,7 +46,7 @@ func newTestSessionWithForwarding(t *testing.T, forwardingEnabled bool) (net.Lis
 
 	return l, client, func() {
 		cleanup()
-		l.Close()
+		closeQuietly(l)
 	}
 }
 

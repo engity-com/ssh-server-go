@@ -2,6 +2,7 @@ package ssh
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -58,8 +59,8 @@ func newClientSession(t *testing.T, addr string, config *gossh.ClientConfig) (*g
 		t.Fatal(err)
 	}
 	return session, client, func() {
-		session.Close()
-		client.Close()
+		closeQuietly(session)
+		closeQuietly(client)
 	}
 }
 
@@ -137,7 +138,7 @@ func TestStdin(t *testing.T) {
 
 func TestUser(t *testing.T) {
 	t.Parallel()
-	testUser := []byte("progrium")
+	testUser := []byte("a_great_user")
 	session, _, cleanup := newTestSession(t, &Server{
 		Handler: func(s Session) {
 			if _, err := io.WriteString(s, s.User()); err != nil {
@@ -199,12 +200,12 @@ func TestExitStatusNonZero(t *testing.T) {
 	}, nil)
 	defer cleanup()
 	err := session.Run("")
-	e, ok := err.(*gossh.ExitError)
-	if !ok {
+	ee, isEe := errors.AsType[*gossh.ExitError](err)
+	if !isEe {
 		t.Fatalf("expected ExitError but got %T", err)
 	}
-	if e.ExitStatus() != 1 {
-		t.Fatalf("exit-status = %#v; want %#v", e.ExitStatus(), 1)
+	if ee.ExitStatus() != 1 {
+		t.Fatalf("exit-status = %#v; want %#v", ee.ExitStatus(), 1)
 	}
 }
 
@@ -296,7 +297,7 @@ func TestPtyResize(t *testing.T) {
 	if gotWinch != winch2 {
 		t.Fatalf("expected window %#v but got %#v", winch2, gotWinch)
 	}
-	session.Close()
+	closeQuietly(session)
 	<-done
 }
 
@@ -323,7 +324,7 @@ func TestSignals(t *testing.T) {
 					return
 				}
 			case <-doneChan:
-				errChan <- fmt.Errorf("Unexpected done")
+				errChan <- fmt.Errorf("unexpected done")
 				return
 			}
 
@@ -334,7 +335,7 @@ func TestSignals(t *testing.T) {
 					return
 				}
 			case <-doneChan:
-				errChan <- fmt.Errorf("Unexpected done")
+				errChan <- fmt.Errorf("unexpected done")
 				return
 			}
 		},
@@ -388,7 +389,7 @@ func TestBreakWithChanRegistered(t *testing.T) {
 					return
 				}
 			case <-doneChan:
-				errChan <- fmt.Errorf("Unexpected done")
+				errChan <- fmt.Errorf("unexpected done")
 				return
 			}
 		},

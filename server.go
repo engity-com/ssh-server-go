@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"sync"
 	"time"
@@ -11,8 +12,8 @@ import (
 	gossh "golang.org/x/crypto/ssh"
 )
 
-// ErrServerClosed is returned by the Server's Serve, ListenAndServe,
-// and ListenAndServeTLS methods after a call to Shutdown or Close.
+// ErrServerClosed is returned by [Server.Serve] and [Server.ListenAndServe]
+// after a call to [Server.Shutdown] or [Server.Close].
 var ErrServerClosed = errors.New("ssh: Server closed")
 
 type SubsystemHandler func(s Session)
@@ -57,12 +58,12 @@ type Server struct {
 	MaxTimeout       time.Duration // absolute connection timeout, none if empty
 
 	// ChannelHandlers allow overriding the built-in session handlers or provide
-	// extensions to the protocol, such as tcpip forwarding. By default only the
+	// extensions to the protocol, such as tcpip forwarding. By default, only the
 	// "session" handler is enabled.
 	ChannelHandlers map[string]ChannelHandler
 
 	// RequestHandlers allow overriding the server-level request handlers or
-	// provide extensions to the protocol, such as tcpip forwarding. By default
+	// provide extensions to the protocol, such as tcpip forwarding. By default,
 	// no handlers are enabled.
 	RequestHandlers map[string]RequestHandler
 
@@ -97,21 +98,21 @@ func (srv *Server) ensureHandlers() {
 	defer srv.mu.Unlock()
 
 	if srv.RequestHandlers == nil {
-		srv.RequestHandlers = map[string]RequestHandler{}
-		for k, v := range DefaultRequestHandlers {
-			srv.RequestHandlers[k] = v
+		srv.RequestHandlers = maps.Clone(DefaultRequestHandlers)
+		if srv.RequestHandlers == nil {
+			srv.RequestHandlers = map[string]RequestHandler{}
 		}
 	}
 	if srv.ChannelHandlers == nil {
-		srv.ChannelHandlers = map[string]ChannelHandler{}
-		for k, v := range DefaultChannelHandlers {
-			srv.ChannelHandlers[k] = v
+		srv.ChannelHandlers = maps.Clone(DefaultChannelHandlers)
+		if srv.ChannelHandlers == nil {
+			srv.ChannelHandlers = map[string]ChannelHandler{}
 		}
 	}
 	if srv.SubsystemHandlers == nil {
-		srv.SubsystemHandlers = map[string]SubsystemHandler{}
-		for k, v := range DefaultSubsystemHandlers {
-			srv.SubsystemHandlers[k] = v
+		srv.SubsystemHandlers = maps.Clone(DefaultSubsystemHandlers)
+		if srv.SubsystemHandlers == nil {
+			srv.SubsystemHandlers = map[string]SubsystemHandler{}
 		}
 	}
 }
@@ -197,7 +198,7 @@ func (srv *Server) Close() error {
 	srv.closeDoneChanLocked()
 	err := srv.closeListenersLocked()
 	for c := range srv.conns {
-		c.Close()
+		closeQuietly(c)
 		delete(srv.conns, c)
 	}
 	return err
@@ -210,7 +211,7 @@ func (srv *Server) Close() error {
 // then the context's error is returned.
 func (srv *Server) Shutdown(ctx context.Context) error {
 	srv.mu.Lock()
-	lnerr := srv.closeListenersLocked()
+	err := srv.closeListenersLocked()
 	srv.closeDoneChanLocked()
 	srv.mu.Unlock()
 
@@ -225,7 +226,7 @@ func (srv *Server) Shutdown(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-finished:
-		return lnerr
+		return err
 	}
 }
 
@@ -236,7 +237,7 @@ func (srv *Server) Shutdown(ctx context.Context) error {
 // Serve always returns a non-nil error.
 func (srv *Server) Serve(l net.Listener) error {
 	srv.ensureHandlers()
-	defer l.Close()
+	defer closeQuietly(l)
 	if err := srv.ensureHostSigner(); err != nil {
 		return err
 	}
@@ -255,14 +256,14 @@ func (srv *Server) Serve(l net.Listener) error {
 				return ErrServerClosed
 			default:
 			}
-			if ne, ok := e.(net.Error); ok && ne.Temporary() {
+			if ne, ok := errors.AsType[net.Error](e); ok && ne.Temporary() {
 				if tempDelay == 0 {
 					tempDelay = 5 * time.Millisecond
 				} else {
 					tempDelay *= 2
 				}
-				if max := 1 * time.Second; tempDelay > max {
-					tempDelay = max
+				if v := 1 * time.Second; tempDelay > v {
+					tempDelay = v
 				}
 				time.Sleep(tempDelay)
 				continue
@@ -278,7 +279,7 @@ func (srv *Server) HandleConn(newConn net.Conn) {
 	if srv.ConnCallback != nil {
 		cbConn := srv.ConnCallback(ctx, newConn)
 		if cbConn == nil {
-			newConn.Close()
+			closeQuietly(newConn)
 			return
 		}
 		newConn = cbConn
@@ -295,7 +296,7 @@ func (srv *Server) HandleConn(newConn net.Conn) {
 		conn.handshakeDeadline = time.Now().Add(srv.HandshakeTimeout)
 	}
 	conn.updateDeadline()
-	defer conn.Close()
+	defer closeQuietly(conn)
 	sshConn, chans, reqs, err := gossh.NewServerConn(conn, srv.config(ctx))
 	if err != nil {
 		if srv.ConnectionFailedCallback != nil {
@@ -426,8 +427,8 @@ func (srv *Server) closeDoneChanLocked() {
 func (srv *Server) closeListenersLocked() error {
 	var err error
 	for ln := range srv.listeners {
-		if cerr := ln.Close(); cerr != nil && err == nil {
-			err = cerr
+		if cErr := ln.Close(); cErr != nil && err == nil {
+			err = cErr
 		}
 		delete(srv.listeners, ln)
 	}

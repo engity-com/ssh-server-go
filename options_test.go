@@ -110,6 +110,6 @@ func TestConnWrapping(t *testing.T) {
 		t.Fatal(err)
 	}
 	if atomic.LoadInt32(&(wrapped.written)) == 0 {
-		t.Fatal("wrapped conn not written to")
+		t.Fatal("wrapped connection not written to")
 	}
 }

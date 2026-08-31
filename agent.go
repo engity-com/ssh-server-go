@@ -58,12 +58,12 @@ func ForwardAgentConnections(l net.Listener, s Session) {
 			return
 		}
 		go func(conn net.Conn) {
-			defer conn.Close()
+			defer closeQuietly(conn)
 			channel, reqs, err := sshConn.OpenChannel(agentChannelType, nil)
 			if err != nil {
 				return
 			}
-			defer channel.Close()
+			defer closeQuietly(channel)
 			go gossh.DiscardRequests(reqs)
 			var wg sync.WaitGroup
 			wg.Add(2)
