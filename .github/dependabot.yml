@@ -6,6 +6,11 @@ updates:
       interval: "daily"
 
   - package-ecosystem: "gomod"
-    directory: "/"
+    directories:
+     - "/"
+     - "/_examples/*"
     schedule:
       interval: "daily"
+    groups:
+      same-dependency:
+        group-by: dependency-name
