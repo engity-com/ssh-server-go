@@ -26,6 +26,13 @@ type localForwardChannelData struct {
 // DirectTCPIPHandler can be enabled by adding it to the server's
 // ChannelHandlers under direct-tcpip.
 func DirectTCPIPHandler(srv *Server, sshConn *gossh.ServerConn, newChan gossh.NewChannel, ctx Context) {
+	if newChan == nil {
+		return
+	}
+	if srv == nil || sshConn == nil || ctx == nil {
+		_ = newChan.Reject(gossh.ConnectionFailed, "missing server connection context")
+		return
+	}
 	settings := serverSettingsFromContext(ctx, srv)
 	d := localForwardChannelData{}
 	if err := gossh.Unmarshal(newChan.ExtraData(), &d); err != nil {
@@ -120,12 +127,18 @@ func newForward(listener net.Listener) *forward {
 }
 
 func (h *ForwardedTCPHandler) HandleSSHRequest(ctx Context, srv *Server, req *gossh.Request) (bool, []byte) {
+	if h == nil || ctx == nil || srv == nil || req == nil {
+		return false, []byte("missing server connection context")
+	}
+	conn, ok := ctx.Value(ContextKeyConn).(*gossh.ServerConn)
+	if !ok || conn == nil {
+		return false, []byte("missing server connection context")
+	}
 	h.Lock()
 	if h.forwards == nil {
 		h.forwards = make(map[forwardKey]*forward)
 	}
 	h.Unlock()
-	conn := ctx.Value(ContextKeyConn).(*gossh.ServerConn)
 	settings := serverSettingsFromContext(ctx, srv)
 	switch req.Type {
 	case "tcpip-forward":
@@ -164,7 +177,7 @@ func (h *ForwardedTCPHandler) HandleSSHRequest(ctx Context, srv *Server, req *go
 			return false, []byte{}
 		}
 		_, destPortStr, _ := net.SplitHostPort(ln.Addr().String())
-		destPort, _ := strconv.Atoi(destPortStr)
+		destPort, _ := strconv.ParseUint(destPortStr, 10, 16)
 		key := forwardKey{conn: conn, addr: net.JoinHostPort(reqPayload.BindAddr, destPortStr)}
 		f := newForward(ln)
 		h.Lock()
@@ -186,7 +199,7 @@ func (h *ForwardedTCPHandler) HandleSSHRequest(ctx Context, srv *Server, req *go
 					break
 				}
 				originAddr, orignPortStr, _ := net.SplitHostPort(c.RemoteAddr().String())
-				originPort, _ := strconv.Atoi(orignPortStr)
+				originPort, _ := strconv.ParseUint(orignPortStr, 10, 16)
 				payload := gossh.Marshal(&remoteForwardChannelData{
 					DestAddr:   reqPayload.BindAddr,
 					DestPort:   uint32(destPort),

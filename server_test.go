@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -51,6 +52,237 @@ func TestRequireHostSigners(t *testing.T) {
 	require.NoError(t, generated.ensureHostSigner())
 }
 
+func TestHandleConnInitializesHostSigner(t *testing.T) {
+	srv := &Server{}
+	listener := newLocalListener()
+	defer closeQuietly(listener)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		serverConn, err := listener.Accept()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		srv.HandleConn(serverConn)
+	}()
+
+	clientConn, err := net.Dial("tcp", listener.Addr().String())
+	require.NoError(t, err)
+	conn, chans, reqs, err := gossh.NewClientConn(clientConn, listener.Addr().String(), &gossh.ClientConfig{
+		User:            "user",
+		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
+	})
+	require.NoError(t, err)
+	client := gossh.NewClient(conn, chans, reqs)
+	require.NoError(t, client.Close())
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("HandleConn did not stop after the client closed")
+	}
+	srv.mu.RLock()
+	require.Len(t, srv.HostSigners, 1)
+	srv.mu.RUnlock()
+}
+
+func TestHandleConnReportsRequiredHostSigner(t *testing.T) {
+	callbackResult := make(chan error, 1)
+	srv := &Server{RequireHostSigners: true}
+	srv.ConnectionFailedCallback = func(_ net.Conn, err error) {
+		callbackResult <- errors.Join(err, srv.SetOption(NoPty()))
+	}
+	serverConn, clientConn := net.Pipe()
+	defer closeQuietly(clientConn)
+	srv.HandleConn(serverConn)
+
+	require.ErrorIs(t, <-callbackResult, ErrServerHostSignerRequired)
+	_ = clientConn.SetReadDeadline(time.Now().Add(time.Second))
+	_, err := clientConn.Read(make([]byte, 1))
+	require.Error(t, err)
+	srv.mu.RLock()
+	require.Empty(t, srv.activeConns)
+	require.Zero(t, srv.startups)
+	drained := srv.drainedChan
+	srv.mu.RUnlock()
+	select {
+	case <-drained:
+	default:
+		t.Fatal("host signer failure did not drain the generation")
+	}
+}
+
+func TestRequireClientAuthReportsMissingAuthentication(t *testing.T) {
+	result := make(chan error, 1)
+	srv := &Server{
+		RequireClientAuth: true,
+		ConnectionFailedCallback: func(_ net.Conn, err error) {
+			result <- err
+		},
+	}
+	serverConn, clientConn := net.Pipe()
+	defer closeQuietly(clientConn)
+	srv.HandleConn(serverConn)
+	require.ErrorIs(t, <-result, ErrServerClientAuthRequired)
+}
+
+func TestRequireClientAuthRejectsExplicitAnonymousAuthentication(t *testing.T) {
+	config := &gossh.ServerConfig{
+		NoClientAuth:     true,
+		PasswordCallback: func(gossh.ConnMetadata, []byte) (*gossh.Permissions, error) { return nil, nil },
+	}
+	require.False(t, serverConfigHasClientAuth(config))
+}
+
+func TestAuthCallbacksReceiveCurrentMetadata(t *testing.T) {
+	ctx, cancel := newContext(nil)
+	defer cancel()
+	var authUser, bannerUser string
+	srv := &Server{ServerConfigCallback: func(ctx Context, config *gossh.ServerConfig) {
+		config.AuthLogCallback = func(gossh.ConnMetadata, string, error) { authUser = ctx.User() }
+		config.BannerCallback = func(gossh.ConnMetadata) string {
+			bannerUser = ctx.User()
+			return "banner"
+		}
+	}}
+	config := srv.config(ctx)
+	metadata := testConnMetadata{user: "current-user"}
+	require.Equal(t, "banner", config.BannerCallback(metadata))
+	config.AuthLogCallback(metadata, "none", ErrServerPermissionDenied)
+	require.Equal(t, "current-user", bannerUser)
+	require.Equal(t, "current-user", authUser)
+}
+
+func TestPreAuthCallbackReceivesCurrentContextMetadata(t *testing.T) {
+	type metadata struct {
+		user          string
+		sessionID     string
+		clientVersion string
+		serverVersion string
+		localAddr     string
+		remoteAddr    string
+	}
+	observed := make(chan metadata, 1)
+	srv := &Server{ServerConfigCallback: func(ctx Context, config *gossh.ServerConfig) {
+		config.PreAuthConnCallback = func(gossh.ServerPreAuthConn) {
+			observed <- metadata{
+				user:          ctx.User(),
+				sessionID:     ctx.SessionID(),
+				clientVersion: ctx.ClientVersion(),
+				serverVersion: ctx.ServerVersion(),
+				localAddr:     ctx.LocalAddr().String(),
+				remoteAddr:    ctx.RemoteAddr().String(),
+			}
+		}
+	}}
+	session, _, cleanup := newTestSession(t, srv, nil)
+	defer cleanup()
+	defer closeQuietly(session)
+	result := <-observed
+	require.Empty(t, result.user)
+	require.NotEmpty(t, result.sessionID)
+	require.NotEmpty(t, result.clientVersion)
+	require.NotEmpty(t, result.serverVersion)
+	require.NotEmpty(t, result.localAddr)
+	require.NotEmpty(t, result.remoteAddr)
+}
+
+func TestConflictingAuthenticationCallbacksAreRejected(t *testing.T) {
+	ctx, cancel := newContext(nil)
+	defer cancel()
+	signer, err := generateSigner()
+	require.NoError(t, err)
+	srv := &Server{
+		PasswordHandler:            func(Context, string) bool { return true },
+		PublicKeyHandler:           func(Context, PublicKey) bool { return true },
+		KeyboardInteractiveHandler: func(Context, gossh.KeyboardInteractiveChallenge) bool { return true },
+		ServerConfigCallback: func(_ Context, config *gossh.ServerConfig) {
+			config.PasswordCallback = func(gossh.ConnMetadata, []byte) (*gossh.Permissions, error) { return nil, nil }
+			config.PublicKeyCallback = func(gossh.ConnMetadata, gossh.PublicKey) (*gossh.Permissions, error) { return nil, nil }
+			config.KeyboardInteractiveCallback = func(gossh.ConnMetadata, gossh.KeyboardInteractiveChallenge) (*gossh.Permissions, error) {
+				return nil, nil
+			}
+		},
+	}
+	config := srv.config(ctx)
+	metadata := testConnMetadata{user: "user"}
+	_, err = config.PasswordCallback(metadata, nil)
+	require.ErrorIs(t, err, ErrServerAuthCallbackConflict)
+	_, err = config.PublicKeyCallback(metadata, signer.PublicKey())
+	require.ErrorIs(t, err, ErrServerAuthCallbackConflict)
+	_, err = config.KeyboardInteractiveCallback(metadata, nil)
+	require.ErrorIs(t, err, ErrServerAuthCallbackConflict)
+}
+
+func TestConflictingPartialSuccessCallbacksAreRejected(t *testing.T) {
+	ctx, cancel := newContext(nil)
+	defer cancel()
+	srv := &Server{
+		PasswordHandler:            func(Context, string) bool { return true },
+		PublicKeyHandler:           func(Context, PublicKey) bool { return true },
+		KeyboardInteractiveHandler: func(Context, gossh.KeyboardInteractiveChallenge) bool { return true },
+		ServerConfigCallback: func(_ Context, config *gossh.ServerConfig) {
+			config.GSSAPIWithMICConfig = &gossh.GSSAPIWithMICConfig{AllowLogin: func(gossh.ConnMetadata, string) (*gossh.Permissions, error) {
+				return nil, &gossh.PartialSuccessError{Next: gossh.ServerAuthCallbacks{
+					PasswordCallback: func(gossh.ConnMetadata, []byte) (*gossh.Permissions, error) {
+						return nil, nil
+					},
+					PublicKeyCallback: func(gossh.ConnMetadata, gossh.PublicKey) (*gossh.Permissions, error) {
+						return nil, nil
+					},
+					KeyboardInteractiveCallback: func(gossh.ConnMetadata, gossh.KeyboardInteractiveChallenge) (*gossh.Permissions, error) {
+						return nil, nil
+					},
+				}}
+			}}
+		},
+	}
+	config := srv.config(ctx)
+	_, err := config.GSSAPIWithMICConfig.AllowLogin(testConnMetadata{user: "user"}, "user@DOMAIN")
+	partial := new(gossh.PartialSuccessError)
+	require.ErrorAs(t, err, &partial)
+	_, err = partial.Next.PasswordCallback(testConnMetadata{user: "user"}, nil)
+	require.ErrorIs(t, err, ErrServerAuthCallbackConflict)
+	_, err = partial.Next.PublicKeyCallback(testConnMetadata{user: "user"}, nil)
+	require.ErrorIs(t, err, ErrServerAuthCallbackConflict)
+	_, err = partial.Next.KeyboardInteractiveCallback(testConnMetadata{user: "user"}, nil)
+	require.ErrorIs(t, err, ErrServerAuthCallbackConflict)
+}
+
+func TestHandleConnNaturalReuseStartsFreshDrainLifecycle(t *testing.T) {
+	secondEntered := make(chan struct{})
+	releaseSecond := make(chan struct{})
+	var calls atomic.Int32
+	srv := &Server{ConnCallback: func(Context, net.Conn) net.Conn {
+		if calls.Add(1) == 2 {
+			close(secondEntered)
+			<-releaseSecond
+		}
+		return nil
+	}}
+	first, firstPeer := net.Pipe()
+	defer closeQuietly(firstPeer)
+	srv.HandleConn(first)
+
+	second, secondPeer := net.Pipe()
+	defer closeQuietly(secondPeer)
+	secondDone := make(chan struct{})
+	go func() {
+		defer close(secondDone)
+		srv.HandleConn(second)
+	}()
+	<-secondEntered
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	require.ErrorIs(t, srv.Shutdown(ctx), context.DeadlineExceeded)
+	close(releaseSecond)
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("reused direct connection did not drain")
+	}
+}
+
 func TestConnectionSettingsSnapshot(t *testing.T) {
 	timeout := time.Second
 	oldHandlerCalled := false
@@ -92,6 +324,38 @@ func TestSetOptionRejectsRunningServer(t *testing.T) {
 	srv.activeConns = nil
 	require.NoError(t, srv.SetOption(option))
 	require.True(t, called)
+}
+
+func TestHandleConnIsRejectedDuringOptionUpdate(t *testing.T) {
+	optionEntered := make(chan struct{})
+	releaseOption := make(chan struct{})
+	srv := &Server{}
+	optionDone := make(chan error, 1)
+	go func() {
+		optionDone <- srv.SetOption(func(*Server) error {
+			close(optionEntered)
+			<-releaseOption
+			return nil
+		})
+	}()
+	<-optionEntered
+	serverConn, clientConn := net.Pipe()
+	defer closeQuietly(clientConn)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.HandleConn(serverConn)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("HandleConn waited untracked for an option update")
+	}
+	_ = clientConn.SetReadDeadline(time.Now().Add(time.Second))
+	_, err := clientConn.Read(make([]byte, 1))
+	require.Error(t, err)
+	close(releaseOption)
+	require.NoError(t, <-optionDone)
 }
 
 func TestServerConfigUsesAlgorithmDefaults(t *testing.T) {
@@ -322,6 +586,7 @@ func TestPublicKeyStateIsPublishedOnlyAfterVerification(t *testing.T) {
 	require.Nil(t, ctx.Value(ContextKeyPublicKey))
 	verified, err := config.VerifiedPublicKeyCallback(metadata, key, permissions, key.Type())
 	require.NoError(t, err)
+	config.AuthLogCallback(metadata, "publickey", nil)
 	require.Equal(t, key, ctx.Value(ContextKeyPublicKey))
 	require.Equal(t, "public-key", verified.Extensions["method"])
 }
@@ -345,7 +610,204 @@ func TestCustomPublicKeyCallbackPublishesVerifiedKey(t *testing.T) {
 	require.Nil(t, ctx.Value(ContextKeyPublicKey))
 	_, err = config.VerifiedPublicKeyCallback(metadata, key, permissions, key.Type())
 	require.NoError(t, err)
+	config.AuthLogCallback(metadata, "publickey", nil)
 	require.Equal(t, key, ctx.Value(ContextKeyPublicKey))
+}
+
+func TestCustomVerifiedPublicKeyCallbackPublishesReturnedPermissions(t *testing.T) {
+	ctx, cancel := newContext(nil)
+	defer cancel()
+	signer, err := generateSigner()
+	require.NoError(t, err)
+	replacement := &gossh.Permissions{
+		CriticalOptions: map[string]string{"source-address": "127.0.0.1"},
+		Extensions:      map[string]string{"role": "admin"},
+		ExtraData:       map[any]any{"audit": "verified"},
+	}
+	srv := &Server{ServerConfigCallback: func(_ Context, config *gossh.ServerConfig) {
+		config.PublicKeyCallback = func(gossh.ConnMetadata, gossh.PublicKey) (*gossh.Permissions, error) {
+			return &gossh.Permissions{}, nil
+		}
+		config.VerifiedPublicKeyCallback = func(gossh.ConnMetadata, gossh.PublicKey, *gossh.Permissions, string) (*gossh.Permissions, error) {
+			return replacement, nil
+		}
+	}}
+	config := srv.config(ctx)
+	metadata := testConnMetadata{user: "user"}
+	permissions, err := config.PublicKeyCallback(metadata, signer.PublicKey())
+	require.NoError(t, err)
+	verified, err := config.VerifiedPublicKeyCallback(metadata, signer.PublicKey(), permissions, signer.PublicKey().Type())
+	require.NoError(t, err)
+	require.Same(t, replacement, verified)
+	require.Same(t, replacement, ctx.Permissions().Permissions)
+}
+
+func TestPublicKeyPartialSuccessPreservesVerifiedKey(t *testing.T) {
+	ctx, cancel := newContext(nil)
+	defer cancel()
+	signer, err := generateSigner()
+	require.NoError(t, err)
+	key := signer.PublicKey()
+	srv := &Server{ServerConfigCallback: func(_ Context, config *gossh.ServerConfig) {
+		config.PublicKeyCallback = func(gossh.ConnMetadata, gossh.PublicKey) (*gossh.Permissions, error) {
+			return &gossh.Permissions{}, nil
+		}
+		config.VerifiedPublicKeyCallback = func(gossh.ConnMetadata, gossh.PublicKey, *gossh.Permissions, string) (*gossh.Permissions, error) {
+			return nil, &gossh.PartialSuccessError{Next: gossh.ServerAuthCallbacks{
+				PasswordCallback: func(gossh.ConnMetadata, []byte) (*gossh.Permissions, error) {
+					return &gossh.Permissions{}, nil
+				},
+			}}
+		}
+	}}
+	config := srv.config(ctx)
+	metadata := testConnMetadata{user: "user"}
+	permissions, err := config.PublicKeyCallback(metadata, key)
+	require.NoError(t, err)
+	_, err = config.VerifiedPublicKeyCallback(metadata, key, permissions, key.Type())
+	partial := new(gossh.PartialSuccessError)
+	require.ErrorAs(t, err, &partial)
+	config.AuthLogCallback(metadata, "publickey", err)
+	require.Equal(t, key, ctx.Value(ContextKeyPublicKey))
+	_, err = partial.Next.PasswordCallback(metadata, []byte("second-factor"))
+	require.NoError(t, err)
+	config.AuthLogCallback(metadata, "password", nil)
+	require.Equal(t, key, ctx.Value(ContextKeyPublicKey))
+}
+
+func TestPublicKeyVerificationFailureDoesNotPublishKey(t *testing.T) {
+	ctx, cancel := newContext(nil)
+	defer cancel()
+	signer, err := generateSigner()
+	require.NoError(t, err)
+	srv := &Server{ServerConfigCallback: func(_ Context, config *gossh.ServerConfig) {
+		config.PublicKeyCallback = func(gossh.ConnMetadata, gossh.PublicKey) (*gossh.Permissions, error) {
+			return &gossh.Permissions{}, nil
+		}
+		config.VerifiedPublicKeyCallback = func(gossh.ConnMetadata, gossh.PublicKey, *gossh.Permissions, string) (*gossh.Permissions, error) {
+			return nil, ErrServerPermissionDenied
+		}
+	}}
+	config := srv.config(ctx)
+	metadata := testConnMetadata{user: "user"}
+	permissions, err := config.PublicKeyCallback(metadata, signer.PublicKey())
+	require.NoError(t, err)
+	_, err = config.VerifiedPublicKeyCallback(metadata, signer.PublicKey(), permissions, signer.PublicKey().Type())
+	require.ErrorIs(t, err, ErrServerPermissionDenied)
+	config.AuthLogCallback(metadata, "publickey", err)
+	require.Nil(t, ctx.Value(ContextKeyPublicKey))
+}
+
+func TestVerifiedPublicKeyCallbackPreservesNilPermissions(t *testing.T) {
+	for _, withPublicKeyHandler := range []bool{false, true} {
+		t.Run(fmt.Sprintf("public-key-handler=%t", withPublicKeyHandler), func(t *testing.T) {
+			ctx, cancel := newContext(nil)
+			defer cancel()
+			signer, err := generateSigner()
+			require.NoError(t, err)
+			srv := &Server{ServerConfigCallback: func(_ Context, config *gossh.ServerConfig) {
+				config.VerifiedPublicKeyCallback = func(gossh.ConnMetadata, gossh.PublicKey, *gossh.Permissions, string) (*gossh.Permissions, error) {
+					return nil, nil
+				}
+				if !withPublicKeyHandler {
+					config.PublicKeyCallback = func(gossh.ConnMetadata, gossh.PublicKey) (*gossh.Permissions, error) {
+						return &gossh.Permissions{}, nil
+					}
+				}
+			}}
+			if withPublicKeyHandler {
+				srv.PublicKeyHandler = func(Context, PublicKey) bool { return true }
+			}
+			config := srv.config(ctx)
+			metadata := testConnMetadata{user: "user"}
+			permissions, err := config.PublicKeyCallback(metadata, signer.PublicKey())
+			require.NoError(t, err)
+			verified, err := config.VerifiedPublicKeyCallback(metadata, signer.PublicKey(), permissions, signer.PublicKey().Type())
+			require.NoError(t, err)
+			require.Nil(t, verified)
+			require.NotNil(t, ctx.Permissions().Permissions)
+		})
+	}
+}
+
+func TestRejectedVerifiedKeyDoesNotLeakIntoPasswordAuthentication(t *testing.T) {
+	ctx, cancel := newContext(nil)
+	defer cancel()
+	signer, err := generateSigner()
+	require.NoError(t, err)
+	srv := &Server{
+		PasswordHandler: func(Context, string) bool { return true },
+		ServerConfigCallback: func(_ Context, config *gossh.ServerConfig) {
+			config.PublicKeyCallback = func(gossh.ConnMetadata, gossh.PublicKey) (*gossh.Permissions, error) {
+				return &gossh.Permissions{}, nil
+			}
+		},
+	}
+	config := srv.config(ctx)
+	metadata := testConnMetadata{user: "user"}
+	permissions, err := config.PublicKeyCallback(metadata, signer.PublicKey())
+	require.NoError(t, err)
+	_, err = config.VerifiedPublicKeyCallback(metadata, signer.PublicKey(), permissions, signer.PublicKey().Type())
+	require.NoError(t, err)
+	config.AuthLogCallback(metadata, "publickey", errors.New("source-address rejected"))
+	require.Nil(t, ctx.Value(ContextKeyPublicKey))
+
+	_, err = config.PasswordCallback(metadata, []byte("fallback"))
+	require.NoError(t, err)
+	config.AuthLogCallback(metadata, "password", nil)
+	require.Nil(t, ctx.Value(ContextKeyPublicKey))
+}
+
+func TestRejectedVerifiedKeyDoesNotReachPasswordSession(t *testing.T) {
+	signer, err := generateSigner()
+	require.NoError(t, err)
+	publicKeySeen := make(chan bool, 1)
+	srv := &Server{
+		Handler:         func(s Session) { publicKeySeen <- s.PublicKey() != nil },
+		PasswordHandler: func(Context, string) bool { return true },
+		ServerConfigCallback: func(_ Context, config *gossh.ServerConfig) {
+			config.PublicKeyCallback = func(gossh.ConnMetadata, gossh.PublicKey) (*gossh.Permissions, error) {
+				return &gossh.Permissions{}, nil
+			}
+			config.VerifiedPublicKeyCallback = func(gossh.ConnMetadata, gossh.PublicKey, *gossh.Permissions, string) (*gossh.Permissions, error) {
+				return &gossh.Permissions{CriticalOptions: map[string]string{
+					"source-address": "192.0.2.1",
+				}}, nil
+			}
+		},
+	}
+	session, _, cleanup := newTestSession(t, srv, &gossh.ClientConfig{
+		User: "user",
+		Auth: []gossh.AuthMethod{gossh.PublicKeys(signer), gossh.Password("fallback")},
+	})
+	defer cleanup()
+	require.NoError(t, session.Run(""))
+	require.False(t, <-publicKeySeen)
+}
+
+func TestPartialSuccessNextPublicKeyReachesSession(t *testing.T) {
+	signer, err := generateSigner()
+	require.NoError(t, err)
+	publicKeySeen := make(chan PublicKey, 1)
+	srv := &Server{
+		Handler: func(s Session) { publicKeySeen <- s.PublicKey() },
+		ServerConfigCallback: func(_ Context, config *gossh.ServerConfig) {
+			config.PasswordCallback = func(gossh.ConnMetadata, []byte) (*gossh.Permissions, error) {
+				return nil, &gossh.PartialSuccessError{Next: gossh.ServerAuthCallbacks{
+					PublicKeyCallback: func(gossh.ConnMetadata, gossh.PublicKey) (*gossh.Permissions, error) {
+						return &gossh.Permissions{}, nil
+					},
+				}}
+			}
+		},
+	}
+	session, _, cleanup := newTestSession(t, srv, &gossh.ClientConfig{
+		User: "user",
+		Auth: []gossh.AuthMethod{gossh.Password("first-factor"), gossh.PublicKeys(signer)},
+	})
+	defer cleanup()
+	require.NoError(t, session.Run(""))
+	require.True(t, KeysEqual(signer.PublicKey(), <-publicKeySeen))
 }
 
 type testConnMetadata struct {
@@ -755,9 +1217,9 @@ func TestServerCloseRejectsConnCallbackReplacement(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestServerReuseWaitsForPreviousGeneration(t *testing.T) {
+func TestServerReuseRejectsConnectionsUntilPreviousGenerationDrains(t *testing.T) {
 	firstEntered := make(chan struct{})
-	secondEntered := make(chan struct{})
+	thirdEntered := make(chan struct{})
 	releaseFirst := make(chan struct{})
 	setOptionResult := make(chan error, 1)
 	var calls atomic.Int32
@@ -768,7 +1230,7 @@ func TestServerReuseWaitsForPreviousGeneration(t *testing.T) {
 			<-releaseFirst
 			setOptionResult <- srv.SetOption(NoPty())
 		} else {
-			close(secondEntered)
+			close(thirdEntered)
 		}
 		return nil
 	}}
@@ -786,18 +1248,62 @@ func TestServerReuseWaitsForPreviousGeneration(t *testing.T) {
 		srv.HandleConn(second)
 	}()
 	select {
-	case <-secondEntered:
-		t.Fatal("new generation started before the previous one drained")
-	case <-time.After(20 * time.Millisecond):
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("connection was not rejected while the previous generation drained")
 	}
+	_ = secondPeer.SetReadDeadline(time.Now().Add(time.Second))
+	_, err := secondPeer.Read(make([]byte, 1))
+	require.Error(t, err)
 	close(releaseFirst)
 	require.ErrorIs(t, <-setOptionResult, ErrServerRunning)
+	require.Eventually(t, func() bool {
+		srv.mu.RLock()
+		defer srv.mu.RUnlock()
+		return len(srv.activeConns) == 0
+	}, time.Second, time.Millisecond)
+
+	third, thirdPeer := net.Pipe()
+	defer closeQuietly(thirdPeer)
+	thirdDone := make(chan struct{})
+	go func() {
+		defer close(thirdDone)
+		srv.HandleConn(third)
+	}()
 	select {
-	case <-secondEntered:
+	case <-thirdEntered:
 	case <-time.After(time.Second):
 		t.Fatal("new generation did not start after the previous one drained")
 	}
-	<-secondDone
+	<-thirdDone
+}
+
+func TestHandleConnIsTrackedBeforeConfiguration(t *testing.T) {
+	srv := &Server{ConnCallback: func(Context, net.Conn) net.Conn { return nil }}
+	serverConn, clientConn := net.Pipe()
+	defer closeQuietly(clientConn)
+	srv.configMu.Lock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.HandleConn(serverConn)
+	}()
+	require.Eventually(t, func() bool {
+		srv.mu.RLock()
+		defer srv.mu.RUnlock()
+		return len(srv.activeConns) == 1
+	}, time.Second, time.Millisecond)
+	err := srv.Close()
+	srv.configMu.Unlock()
+	require.NoError(t, err)
+	_ = clientConn.SetReadDeadline(time.Now().Add(time.Second))
+	_, err = clientConn.Read(make([]byte, 1))
+	require.Error(t, err)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("HandleConn did not return after Close")
+	}
 }
 
 func TestServerConnDeadlineAccessIsSynchronized(t *testing.T) {

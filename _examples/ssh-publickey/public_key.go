@@ -20,6 +20,7 @@ func main() {
 		return true // allow all keys, or use ssh.KeysEqual() to compare against known keys
 	})
 
-	log.Println("starting ssh server on port 2222...")
-	log.Fatal(ssh.ListenAndServe(":2222", nil, publicKeyOption))
+	log.Println("DEVELOPMENT ONLY: every public key is accepted and the host key is ephemeral")
+	log.Println("starting ssh server on 127.0.0.1:2222...")
+	log.Fatal(ssh.ListenAndServe("127.0.0.1:2222", nil, publicKeyOption))
 }

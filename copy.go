@@ -2,6 +2,7 @@ package ssh
 
 import (
 	"context"
+	"errors"
 	"io"
 	"sync"
 	"time"
@@ -22,9 +23,18 @@ type FullDuplexCopyOpts struct {
 	OnStreamEnd   func(isL2r bool, err error)
 }
 
-// FullDuplexCopy copies data in both directions until both streams finish.
-// It half-closes completed streams and closes both sides on cancellation or error.
+// FullDuplexCopy copies data in both directions until both streams finish. It
+// half-closes completed streams and closes both sides on cancellation or error.
+// To guarantee cancellation, Close on each side must unblock concurrent Read and
+// Write calls; implementations that do not honor that contract can prevent this
+// function from returning. A nil context is treated as context.Background.
 func FullDuplexCopy(ctx context.Context, left io.ReadWriteCloser, right io.ReadWriteCloser, opts *FullDuplexCopyOpts) (rErr error) {
+	if left == nil || right == nil {
+		return errors.New("ssh: FullDuplexCopy requires two non-nil streams")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	type done struct {
 		wasL2r  bool
 		written int64

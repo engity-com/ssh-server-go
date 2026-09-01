@@ -35,12 +35,12 @@ server's behavior is by creating a custom Server:
 
 	log.Fatal(s.ListenAndServe())
 
-This package automatically handles basic SSH requests like setting environment
-variables, requesting PTY, and changing window size. These requests are
-processed, responded to, and any relevant state is updated. This state is then
-exposed to you via the Session interface.
+This package handles basic SSH requests such as environment variables, PTYs,
+window changes, signals, and breaks. Relevant state and delivery hooks are
+exposed through Session.
 
-The one big feature missing from the Session abstraction is signals. This was
-started, but not completed. Pull Requests welcome!
+The module requires the Go version declared in go.mod. The core package supports
+the operating systems supported by its dependencies; examples that launch Unix
+programs or use Unix sockets have additional platform requirements.
 */
 package ssh

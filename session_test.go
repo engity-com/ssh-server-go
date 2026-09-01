@@ -368,6 +368,134 @@ func TestSignalsUnregisterStopsBufferedDrain(t *testing.T) {
 	require.Equal(t, SIGTERM, <-signals)
 }
 
+func TestClosedSignalChannelPreservesBufferedSignals(t *testing.T) {
+	ctx, cancel := newContext(nil)
+	defer cancel()
+	sess := &session{ctx: ctx, sigBuf: []Signal{SIGINT, SIGTERM}}
+	closedSignals := make(chan Signal)
+	close(closedSignals)
+	sess.Signals(closedSignals)
+	require.Eventually(t, func() bool {
+		sess.Lock()
+		defer sess.Unlock()
+		return sess.sigDrainDone == nil && len(sess.sigBuf) == 2
+	}, time.Second, time.Millisecond)
+
+	signals := make(chan Signal, 2)
+	sess.Signals(signals)
+	require.Equal(t, SIGINT, <-signals)
+	require.Equal(t, SIGTERM, <-signals)
+}
+
+func TestSignalRequestsReceiveReplies(t *testing.T) {
+	ready := make(chan struct{})
+	release := make(chan struct{})
+	session, _, cleanup := newTestSession(t, &Server{Handler: func(s Session) {
+		s.Signals(make(chan Signal, 1))
+		close(ready)
+		<-release
+	}}, nil)
+	defer cleanup()
+	runResult := make(chan error, 1)
+	go func() { runResult <- session.Run("") }()
+	<-ready
+
+	ok, err := session.SendRequest("signal", true, gossh.Marshal(&struct{ Signal string }{string(SIGINT)}))
+	require.NoError(t, err)
+	require.True(t, ok)
+	ok, err = session.SendRequest("signal", true, []byte{0, 0, 0, 5, 'x'})
+	require.NoError(t, err)
+	require.False(t, ok)
+	close(release)
+	require.NoError(t, <-runResult)
+}
+
+func TestHandlerExitCancelsBlockedSignalDelivery(t *testing.T) {
+	ready := make(chan struct{})
+	release := make(chan struct{})
+	serverSession := make(chan *session, 1)
+	session, _, cleanup := newTestSession(t, &Server{Handler: func(s Session) {
+		s.Signals(make(chan Signal))
+		serverSession <- s.(*session)
+		close(ready)
+		<-release
+	}}, nil)
+	defer cleanup()
+	runResult := make(chan error, 1)
+	go func() { runResult <- session.Run("") }()
+	<-ready
+	type requestResult struct {
+		ok  bool
+		err error
+	}
+	signalResult := make(chan requestResult, 1)
+	go func() {
+		ok, err := session.SendRequest("signal", true, gossh.Marshal(&struct{ Signal string }{string(SIGTERM)}))
+		signalResult <- requestResult{ok: ok, err: err}
+	}()
+	internal := <-serverSession
+	require.Eventually(t, func() bool {
+		internal.Lock()
+		defer internal.Unlock()
+		return internal.sigSends == 1
+	}, time.Second, time.Millisecond)
+	close(release)
+	result := <-signalResult
+	require.NoError(t, result.err)
+	require.False(t, result.ok)
+	require.NoError(t, <-runResult)
+}
+
+func TestDeliveredSignalReplyPrecedesHandlerExit(t *testing.T) {
+	ready := make(chan struct{})
+	session, _, cleanup := newTestSession(t, &Server{Handler: func(s Session) {
+		signals := make(chan Signal)
+		s.Signals(signals)
+		close(ready)
+		<-signals
+	}}, nil)
+	defer cleanup()
+	runResult := make(chan error, 1)
+	go func() { runResult <- session.Run("") }()
+	<-ready
+	ok, err := session.SendRequest("signal", true, gossh.Marshal(&struct{ Signal string }{string(SIGTERM)}))
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.NoError(t, <-runResult)
+}
+
+func TestSignalsCannotBeRegisteredAfterExitStarts(t *testing.T) {
+	ctx, cancel := newContext(nil)
+	defer cancel()
+	sess := &session{ctx: ctx}
+	sess.exiting.Store(true)
+	sess.Signals(make(chan Signal))
+	sess.Lock()
+	defer sess.Unlock()
+	require.Nil(t, sess.sigCh)
+}
+
+func TestClosedSignalChannelRejectsRequestWithoutPanic(t *testing.T) {
+	ready := make(chan struct{})
+	release := make(chan struct{})
+	session, _, cleanup := newTestSession(t, &Server{Handler: func(s Session) {
+		signals := make(chan Signal)
+		s.Signals(signals)
+		close(signals)
+		close(ready)
+		<-release
+	}}, nil)
+	defer cleanup()
+	runResult := make(chan error, 1)
+	go func() { runResult <- session.Run("") }()
+	<-ready
+	ok, err := session.SendRequest("signal", true, gossh.Marshal(&struct{ Signal string }{string(SIGTERM)}))
+	require.NoError(t, err)
+	require.False(t, ok)
+	close(release)
+	require.NoError(t, <-runResult)
+}
+
 func TestBreakUnregisterStopsDelivery(t *testing.T) {
 	ctx, cancel := newContext(nil)
 	defer cancel()
@@ -384,6 +512,27 @@ func TestBreakUnregisterStopsDelivery(t *testing.T) {
 	sess.Break(nil)
 	require.False(t, <-result)
 	close(blocked)
+}
+
+func TestClosedBreakChannelRejectsRequestWithoutPanic(t *testing.T) {
+	ready := make(chan struct{})
+	release := make(chan struct{})
+	session, _, cleanup := newTestSession(t, &Server{Handler: func(s Session) {
+		breaks := make(chan bool)
+		s.Break(breaks)
+		close(breaks)
+		close(ready)
+		<-release
+	}}, nil)
+	defer cleanup()
+	runResult := make(chan error, 1)
+	go func() { runResult <- session.Run("") }()
+	<-ready
+	ok, err := session.SendRequest("break", true, nil)
+	require.NoError(t, err)
+	require.False(t, ok)
+	close(release)
+	require.NoError(t, <-runResult)
 }
 
 func TestSessionEnvironmentIsLimited(t *testing.T) {
@@ -420,6 +569,36 @@ func TestUnknownSubsystemDoesNotLeakIntoShell(t *testing.T) {
 	require.Error(t, session.RequestSubsystem("unknown"))
 	require.NoError(t, session.Run(""))
 	require.Empty(t, stdout.String())
+}
+
+func TestSessionPermissionsReturnsIndependentCopy(t *testing.T) {
+	ctx, cancel := newContext(nil)
+	defer cancel()
+	original := &gossh.Permissions{
+		CriticalOptions: map[string]string{"source-address": "127.0.0.1"},
+		Extensions:      map[string]string{"role": "admin"},
+		ExtraData:       map[any]any{"audit": "original"},
+	}
+	ctx.SetValue(ContextKeyPermissions, &Permissions{Permissions: original})
+	sess := &session{ctx: ctx}
+
+	copy := sess.Permissions()
+	require.NotSame(t, original, copy.Permissions)
+	copy.CriticalOptions["source-address"] = "192.0.2.1"
+	copy.Extensions["role"] = "guest"
+	copy.ExtraData["audit"] = "copy"
+	require.Equal(t, "127.0.0.1", original.CriticalOptions["source-address"])
+	require.Equal(t, "admin", original.Extensions["role"])
+	require.Equal(t, "original", original.ExtraData["audit"])
+
+	original.Extensions["role"] = "operator"
+	require.Equal(t, "guest", copy.Extensions["role"])
+
+	ctx.SetValue(ContextKeyPermissions, &Permissions{Permissions: &gossh.Permissions{}})
+	empty := sess.Permissions()
+	require.Nil(t, empty.CriticalOptions)
+	require.Nil(t, empty.Extensions)
+	require.Nil(t, empty.ExtraData)
 }
 
 func TestDefaultMaxSessionsPerConnection(t *testing.T) {
@@ -480,6 +659,69 @@ func TestMaxChannelsPerConnection(t *testing.T) {
 		return err == nil
 	}, time.Second, time.Millisecond)
 	closeQuietly(second)
+}
+
+func TestSessionLimitsRemainReservedUntilHandlerReturns(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		server func(handler Handler) *Server
+	}{
+		{
+			name: "sessions per connection",
+			server: func(handler Handler) *Server {
+				limit := 1
+				return &Server{Handler: handler, MaxSessionsPerConnection: &limit}
+			},
+		},
+		{
+			name: "channels per connection",
+			server: func(handler Handler) *Server {
+				limit, unlimited := 1, 0
+				return &Server{Handler: handler, MaxSessionsPerConnection: &unlimited, MaxChannelsPerConnection: &limit}
+			},
+		},
+		{
+			name: "global channels",
+			server: func(handler Handler) *Server {
+				limit, unlimited := 1, 0
+				return &Server{
+					Handler: handler, MaxSessionsPerConnection: &unlimited,
+					MaxChannelsPerConnection: &unlimited, MaxChannels: &limit,
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			started := make(chan struct{})
+			release := make(chan struct{})
+			first, client, cleanup := newTestSession(t, tc.server(func(Session) {
+				close(started)
+				<-release
+			}), nil)
+			defer cleanup()
+			require.NoError(t, first.Shell())
+			<-started
+			require.NoError(t, first.Close())
+
+			require.Never(t, func() bool {
+				session, err := client.NewSession()
+				if err == nil {
+					closeQuietly(session)
+					return true
+				}
+				return false
+			}, 50*time.Millisecond, time.Millisecond)
+
+			close(release)
+			var next *gossh.Session
+			require.Eventually(t, func() bool {
+				var err error
+				next, err = client.NewSession()
+				return err == nil
+			}, time.Second, time.Millisecond)
+			closeQuietly(next)
+		})
+	}
 }
 
 func TestSignals(t *testing.T) {
@@ -639,4 +881,59 @@ func TestBreakWithoutChanRegistered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected nil but got %v", err)
 	}
+}
+
+func TestHandlerExitCancelsBlockedBreakDelivery(t *testing.T) {
+	ready := make(chan struct{})
+	release := make(chan struct{})
+	serverSession := make(chan *session, 1)
+	session, _, cleanup := newTestSession(t, &Server{Handler: func(s Session) {
+		s.Break(make(chan bool))
+		serverSession <- s.(*session)
+		close(ready)
+		<-release
+	}}, nil)
+	defer cleanup()
+	runResult := make(chan error, 1)
+	go func() { runResult <- session.Run("") }()
+	<-ready
+	type requestResult struct {
+		ok  bool
+		err error
+	}
+	breakResult := make(chan requestResult, 1)
+	go func() {
+		ok, err := session.SendRequest("break", true, nil)
+		breakResult <- requestResult{ok: ok, err: err}
+	}()
+	internal := <-serverSession
+	require.Eventually(t, func() bool {
+		internal.Lock()
+		defer internal.Unlock()
+		return internal.breakSends == 1
+	}, time.Second, time.Millisecond)
+	close(release)
+	select {
+	case result := <-breakResult:
+		require.NoError(t, result.err)
+		require.False(t, result.ok)
+	case <-time.After(time.Second):
+		t.Fatal("handler exit did not cancel blocked break delivery")
+	}
+	select {
+	case err := <-runResult:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("session did not exit after blocked break delivery was canceled")
+	}
+}
+
+func TestBreakCannotBeRegisteredAfterExitStarts(t *testing.T) {
+	ctx, cancel := newContext(nil)
+	defer cancel()
+	sess := &session{ctx: ctx}
+	sess.Break(make(chan bool))
+	sess.stopBreakDeliveryForExit()
+	sess.Break(make(chan bool))
+	require.False(t, sess.deliverBreak())
 }

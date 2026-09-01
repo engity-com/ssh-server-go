@@ -17,10 +17,23 @@ This Go package wraps the [crypto/ssh package](https://pkg.go.dev/golang.org/x/c
          io.WriteString(s, "Hello world\n")
      })
 
-     log.Fatal(ssh.ListenAndServe(":2222", nil))
+     log.Fatal(ssh.ListenAndServe("127.0.0.1:2222", nil))
  }
 
 ```
+
+> [!NOTE]
+> The minimal example uses anonymous authentication and an automatically generated,
+> process-local host key. These defaults are intended for local development only.
+> Production servers should configure `PasswordHandler`, `PublicKeyHandler`, or a
+> custom authentication policy, add a persistent host key, set
+> `RequireHostSigners: true` and `RequireClientAuth: true`, and expose only
+> explicitly intended interfaces and forwarding destinations. Agent forwarding
+> is denied unless `AgentForwardingCallback` explicitly allows it.
+
+The module requires Go 1.27 or newer. The core package is portable across the
+platforms supported by Go and its dependencies; some examples require Unix
+facilities or programs.
 
 ## Getting into this SDK
 

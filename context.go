@@ -19,6 +19,7 @@ var (
 	contextKeyChannelLimiter    = &contextKey{"channel-limiter"}
 	contextKeyServerSettings    = &contextKey{"server-settings"}
 	contextKeyConnectionWorkers = &contextKey{"connection-workers"}
+	contextKeyAuthConflicts     = &contextKey{"auth-callback-conflicts"}
 
 	// ContextKeyUser is a context key for use with Contexts in this package.
 	// The associated value will be of type string.
@@ -53,7 +54,8 @@ var (
 	ContextKeyServer = &contextKey{"ssh-server"}
 
 	// ContextKeyConn is a context key for use with Contexts in this package.
-	// The associated value will be of type gossh.ServerConn.
+	// The associated value will be of type *gossh.ServerConn after the SSH
+	// handshake has completed.
 	ContextKeyConn = &contextKey{"ssh-conn"}
 
 	// ContextKeyPublicKey is a context key for use with Contexts in this package.
@@ -106,34 +108,35 @@ func serverSettingsFromContext(ctx Context, srv *Server) *connectionSettings {
 	return settings
 }
 
-// Context is a package specific context interface. It exposes connection
-// metadata and allows new values to be easily written to it. It's used in
-// authentication handlers and callbacks, and its underlying context.Context is
-// exposed on Session in the session Handler. A connection-scoped lock is also
-// embedded in the context to make it easier to limit operations per-connection.
+// Context is a package-specific context interface. It exposes connection
+// metadata and allows new values to be written to it. Metadata getters return
+// zero values until metadata is available during the SSH handshake. Context is
+// used in authentication handlers and callbacks and exposed by Session.Context.
+// A connection-scoped lock is embedded for coordinating application state.
 type Context interface {
 	context.Context
 	sync.Locker
 
-	// User returns the username used when establishing the SSH connection.
+	// User returns the current username, or "" before metadata is available.
 	User() string
 
-	// SessionID returns the session hash.
+	// SessionID returns the hex-encoded session hash, or "" before it is available.
 	SessionID() string
 
-	// ClientVersion returns the version reported by the client.
+	// ClientVersion returns the version reported by the client, or "" before it is available.
 	ClientVersion() string
 
-	// ServerVersion returns the version reported by the server.
+	// ServerVersion returns the version reported by the server, or "" before it is available.
 	ServerVersion() string
 
-	// RemoteAddr returns the remote address for this connection.
+	// RemoteAddr returns the remote address, or nil before metadata is available.
 	RemoteAddr() net.Addr
 
-	// LocalAddr returns the local address for this connection.
+	// LocalAddr returns the local address, or nil before metadata is available.
 	LocalAddr() net.Addr
 
-	// Permissions returns the Permissions object used for this connection.
+	// Permissions returns the current authentication permissions. Server-created
+	// contexts initialize an empty value before authentication starts.
 	Permissions() *Permissions
 
 	// SetValue allows you to easily write new values into the underlying context.
@@ -188,19 +191,23 @@ func (ctx *sshContext) SetValue(key, value any) {
 }
 
 func (ctx *sshContext) User() string {
-	return ctx.Value(ContextKeyUser).(string)
+	value, _ := ctx.Value(ContextKeyUser).(string)
+	return value
 }
 
 func (ctx *sshContext) SessionID() string {
-	return ctx.Value(ContextKeySessionID).(string)
+	value, _ := ctx.Value(ContextKeySessionID).(string)
+	return value
 }
 
 func (ctx *sshContext) ClientVersion() string {
-	return ctx.Value(ContextKeyClientVersion).(string)
+	value, _ := ctx.Value(ContextKeyClientVersion).(string)
+	return value
 }
 
 func (ctx *sshContext) ServerVersion() string {
-	return ctx.Value(ContextKeyServerVersion).(string)
+	value, _ := ctx.Value(ContextKeyServerVersion).(string)
+	return value
 }
 
 func (ctx *sshContext) RemoteAddr() net.Addr {
@@ -211,9 +218,11 @@ func (ctx *sshContext) RemoteAddr() net.Addr {
 }
 
 func (ctx *sshContext) LocalAddr() net.Addr {
-	return ctx.Value(ContextKeyLocalAddr).(net.Addr)
+	value, _ := ctx.Value(ContextKeyLocalAddr).(net.Addr)
+	return value
 }
 
 func (ctx *sshContext) Permissions() *Permissions {
-	return ctx.Value(ContextKeyPermissions).(*Permissions)
+	value, _ := ctx.Value(ContextKeyPermissions).(*Permissions)
+	return value
 }

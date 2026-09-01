@@ -21,9 +21,11 @@ var (
 	// after a call to [Server.Shutdown] or [Server.Close].
 	ErrServerClosed = errors.New("ssh: Server closed")
 
-	ErrServerPermissionDenied   = errors.New("permission denied")
-	ErrServerHostSignerRequired = errors.New("ssh: at least one persistent host signer is required")
-	ErrServerRunning            = errors.New("ssh: server configuration cannot be changed while running")
+	ErrServerPermissionDenied     = errors.New("permission denied")
+	ErrServerHostSignerRequired   = errors.New("ssh: at least one persistent host signer is required")
+	ErrServerRunning              = errors.New("ssh: server configuration cannot be changed while running")
+	ErrServerClientAuthRequired   = errors.New("ssh: at least one client authentication method is required")
+	ErrServerAuthCallbackConflict = errors.New("ssh: conflicting authentication callbacks")
 )
 
 type SubsystemHandler func(s Session)
@@ -76,6 +78,7 @@ type Server struct {
 	Handler                Handler                // handler to invoke, ssh.DefaultHandler if nil
 	HostSigners            []Signer               // private keys for the host key, must have at least one
 	RequireHostSigners     bool                   // reject startup without an explicitly configured host signer
+	RequireClientAuth      bool                   // reject connections without an effective, non-anonymous client authentication method
 	Version                string                 // server version to be sent before the initial handshake
 	Banner                 string                 // server banner
 	Ciphers                Ciphers                // allowed ciphers, DefaultCiphers if empty
@@ -90,8 +93,9 @@ type Server struct {
 	ConnCallback                  ConnCallback                  // optional callback for wrapping net.Conn before handling
 	LocalPortForwardingCallback   LocalPortForwardingCallback   // callback for allowing local port forwarding, denies all if nil
 	ReversePortForwardingCallback ReversePortForwardingCallback // callback for allowing reverse port forwarding, denies all if nil
-	ServerConfigCallback          ServerConfigCallback          // callback for configuring detailed SSH options
+	ServerConfigCallback          ServerConfigCallback          // callback for detailed SSH options; same-method auth conflicts are rejected
 	SessionRequestCallback        SessionRequestCallback        // callback for allowing or denying SSH sessions
+	AgentForwardingCallback       AgentForwardingCallback       // callback for allowing agent forwarding, denies all if nil
 
 	ConnectionFailedCallback ConnectionFailedCallback // callback to report connection failures
 
@@ -134,6 +138,7 @@ type Server struct {
 	startups                 int
 	authenticatedConnections *atomic.Int64
 	globalChannels           *atomic.Int64
+	configuring              bool
 	doneChan                 chan struct{}
 	drainedChan              chan struct{}
 }
@@ -154,6 +159,7 @@ type connectionSettings struct {
 	handler                       Handler
 	ptyCallback                   PtyCallback
 	sessionRequestCallback        SessionRequestCallback
+	agentForwardingCallback       AgentForwardingCallback
 	localPortForwardingCallback   LocalPortForwardingCallback
 	reversePortForwardingCallback ReversePortForwardingCallback
 	channelHandlers               map[string]ChannelHandler
@@ -169,6 +175,7 @@ type connectionSettings struct {
 	maxReverseForwards            int
 	authenticatedConnections      *atomic.Int64
 	globalChannels                *atomic.Int64
+	requireClientAuth             bool
 }
 
 func (srv *Server) connectionSettings() *connectionSettings {
@@ -197,6 +204,7 @@ func (srv *Server) connectionSettings() *connectionSettings {
 		handler:                       handler,
 		ptyCallback:                   srv.PtyCallback,
 		sessionRequestCallback:        srv.SessionRequestCallback,
+		agentForwardingCallback:       srv.AgentForwardingCallback,
 		localPortForwardingCallback:   srv.LocalPortForwardingCallback,
 		reversePortForwardingCallback: srv.ReversePortForwardingCallback,
 		channelHandlers:               channelHandlers,
@@ -212,6 +220,7 @@ func (srv *Server) connectionSettings() *connectionSettings {
 		maxReverseForwards:            configuredLimit(srv.MaxReverseForwardsPerConnection, DefaultMaxReverseForwardsPerConnection),
 		authenticatedConnections:      srv.authenticatedConnections,
 		globalChannels:                srv.globalChannels,
+		requireClientAuth:             srv.RequireClientAuth,
 	}
 }
 
@@ -227,6 +236,7 @@ func (srv *Server) fallbackConnectionSettings() *connectionSettings {
 		handler:                       handler,
 		ptyCallback:                   srv.PtyCallback,
 		sessionRequestCallback:        srv.SessionRequestCallback,
+		agentForwardingCallback:       srv.AgentForwardingCallback,
 		localPortForwardingCallback:   srv.LocalPortForwardingCallback,
 		reversePortForwardingCallback: srv.ReversePortForwardingCallback,
 		subsystemHandlers:             maps.Clone(srv.SubsystemHandlers),
@@ -306,11 +316,37 @@ func (srv *Server) config(ctx Context) *gossh.ServerConfig {
 	version := srv.Version
 	banner := srv.Banner
 	bannerHandler := srv.BannerHandler
+	requireClientAuth := srv.RequireClientAuth
 	srv.mu.RUnlock()
 
 	config := &gossh.ServerConfig{}
 	if serverConfigCallback != nil {
 		serverConfigCallback(ctx, config)
+	}
+	customBannerCallback := config.BannerCallback
+	customPasswordCallback := config.PasswordCallback
+	customPublicKeyCallback := config.PublicKeyCallback
+	customKeyboardInteractiveCallback := config.KeyboardInteractiveCallback
+	ctx.SetValue(contextKeyAuthConflicts, authCallbackConflicts{
+		password:            passwordHandler != nil,
+		publicKey:           publicKeyHandler != nil,
+		keyboardInteractive: keyboardInteractiveHandler != nil,
+	})
+	preAuthConnCallback := config.PreAuthConnCallback
+	if preAuthConnCallback != nil {
+		config.PreAuthConnCallback = func(conn gossh.ServerPreAuthConn) {
+			applyConnMetadata(ctx, conn)
+			preAuthConnCallback(conn)
+		}
+	}
+	publicKeyState := &publicKeyAuthState{}
+	authLogCallback := config.AuthLogCallback
+	config.AuthLogCallback = func(conn gossh.ConnMetadata, method string, err error) {
+		applyConnMetadata(ctx, conn)
+		publicKeyState.finishAttempt(ctx, method, err)
+		if authLogCallback != nil {
+			authLogCallback(conn, method, err)
+		}
 	}
 	if !ciphers.IsEmpty() || len(config.Ciphers) == 0 {
 		if ciphers.IsEmpty() {
@@ -342,7 +378,7 @@ func (srv *Server) config(ctx Context) *gossh.ServerConfig {
 	for _, signer := range hostSigners {
 		config.AddHostKey(signer)
 	}
-	if passwordHandler == nil && publicKeyHandler == nil && keyboardInteractiveHandler == nil &&
+	if !requireClientAuth && passwordHandler == nil && publicKeyHandler == nil && keyboardInteractiveHandler == nil &&
 		config.PasswordCallback == nil && config.PublicKeyCallback == nil &&
 		config.KeyboardInteractiveCallback == nil && config.GSSAPIWithMICConfig == nil {
 		config.NoClientAuth = true
@@ -359,6 +395,11 @@ func (srv *Server) config(ctx Context) *gossh.ServerConfig {
 		config.BannerCallback = func(conn gossh.ConnMetadata) string {
 			applyConnMetadata(ctx, conn)
 			return bannerHandler(ctx)
+		}
+	} else if banner == "" && customBannerCallback != nil {
+		config.BannerCallback = func(conn gossh.ConnMetadata) string {
+			applyConnMetadata(ctx, conn)
+			return customBannerCallback(conn)
 		}
 	}
 	if config.NoClientAuth {
@@ -378,26 +419,38 @@ func (srv *Server) config(ctx Context) *gossh.ServerConfig {
 		}
 	}
 	if passwordHandler != nil {
-		config.PasswordCallback = func(conn gossh.ConnMetadata, password []byte) (*gossh.Permissions, error) {
-			applyConnMetadata(ctx, conn)
-			permissions := beginAuthAttempt(ctx)
-			if ok := passwordHandler(ctx, string(password)); !ok {
-				return permissions, ErrServerPermissionDenied
+		if customPasswordCallback != nil {
+			config.PasswordCallback = func(gossh.ConnMetadata, []byte) (*gossh.Permissions, error) {
+				return nil, ErrServerAuthCallbackConflict
 			}
-			return permissions, nil
+		} else {
+			config.PasswordCallback = func(conn gossh.ConnMetadata, password []byte) (*gossh.Permissions, error) {
+				applyConnMetadata(ctx, conn)
+				permissions := beginAuthAttempt(ctx)
+				if ok := passwordHandler(ctx, string(password)); !ok {
+					return permissions, ErrServerPermissionDenied
+				}
+				return permissions, nil
+			}
 		}
 	} else if config.PasswordCallback != nil {
 		config.PasswordCallback = wrapPasswordCallback(ctx, config.PasswordCallback)
 	}
 	if publicKeyHandler != nil {
 		verifiedPublicKeyCallback := config.VerifiedPublicKeyCallback
-		config.PublicKeyCallback = func(conn gossh.ConnMetadata, key gossh.PublicKey) (*gossh.Permissions, error) {
-			applyConnMetadata(ctx, conn)
-			permissions := beginAuthAttempt(ctx)
-			if ok := publicKeyHandler(ctx, key); !ok {
-				return permissions, ErrServerPermissionDenied
+		if customPublicKeyCallback != nil {
+			config.PublicKeyCallback = func(gossh.ConnMetadata, gossh.PublicKey) (*gossh.Permissions, error) {
+				return nil, ErrServerAuthCallbackConflict
 			}
-			return permissions, nil
+		} else {
+			config.PublicKeyCallback = func(conn gossh.ConnMetadata, key gossh.PublicKey) (*gossh.Permissions, error) {
+				applyConnMetadata(ctx, conn)
+				permissions := beginAuthAttempt(ctx)
+				if ok := publicKeyHandler(ctx, key); !ok {
+					return permissions, ErrServerPermissionDenied
+				}
+				return permissions, nil
+			}
 		}
 		config.VerifiedPublicKeyCallback = func(conn gossh.ConnMetadata, key gossh.PublicKey, permissions *gossh.Permissions, signatureAlgorithm string) (*gossh.Permissions, error) {
 			applyConnMetadata(ctx, conn)
@@ -405,14 +458,12 @@ func (srv *Server) config(ctx Context) *gossh.ServerConfig {
 				var err error
 				permissions, err = verifiedPublicKeyCallback(conn, key, permissions, signatureAlgorithm)
 				if err != nil {
+					publicKeyState.recordVerified(key, err)
 					return permissions, wrapAuthError(ctx, err)
 				}
 			}
-			if permissions == nil {
-				permissions = &gossh.Permissions{}
-			}
-			ctx.SetValue(ContextKeyPermissions, &Permissions{permissions})
-			ctx.SetValue(ContextKeyPublicKey, key)
+			publicKeyState.recordVerified(key, nil)
+			publishAuthPermissions(ctx, permissions)
 			return permissions, nil
 		}
 	} else if config.PublicKeyCallback != nil {
@@ -421,24 +472,48 @@ func (srv *Server) config(ctx Context) *gossh.ServerConfig {
 		config.VerifiedPublicKeyCallback = func(conn gossh.ConnMetadata, key gossh.PublicKey, permissions *gossh.Permissions, signatureAlgorithm string) (*gossh.Permissions, error) {
 			applyConnMetadata(ctx, conn)
 			if verifiedPublicKeyCallback != nil {
-				permissions, err := verifiedPublicKeyCallback(conn, key, permissions, signatureAlgorithm)
+				var err error
+				permissions, err = verifiedPublicKeyCallback(conn, key, permissions, signatureAlgorithm)
 				if err != nil {
+					publicKeyState.recordVerified(key, err)
 					return permissions, wrapAuthError(ctx, err)
 				}
 			}
+			publicKeyState.recordVerified(key, nil)
 			publishAuthPermissions(ctx, permissions)
-			ctx.SetValue(ContextKeyPublicKey, key)
+			return permissions, nil
+		}
+	} else {
+		verifiedPublicKeyCallback := config.VerifiedPublicKeyCallback
+		config.VerifiedPublicKeyCallback = func(conn gossh.ConnMetadata, key gossh.PublicKey, permissions *gossh.Permissions, signatureAlgorithm string) (*gossh.Permissions, error) {
+			applyConnMetadata(ctx, conn)
+			if verifiedPublicKeyCallback != nil {
+				var err error
+				permissions, err = verifiedPublicKeyCallback(conn, key, permissions, signatureAlgorithm)
+				if err != nil {
+					publicKeyState.recordVerified(key, err)
+					return permissions, wrapAuthError(ctx, err)
+				}
+			}
+			publicKeyState.recordVerified(key, nil)
+			publishAuthPermissions(ctx, permissions)
 			return permissions, nil
 		}
 	}
 	if keyboardInteractiveHandler != nil {
-		config.KeyboardInteractiveCallback = func(conn gossh.ConnMetadata, challenger gossh.KeyboardInteractiveChallenge) (*gossh.Permissions, error) {
-			applyConnMetadata(ctx, conn)
-			permissions := beginAuthAttempt(ctx)
-			if ok := keyboardInteractiveHandler(ctx, challenger); !ok {
-				return permissions, ErrServerPermissionDenied
+		if customKeyboardInteractiveCallback != nil {
+			config.KeyboardInteractiveCallback = func(gossh.ConnMetadata, gossh.KeyboardInteractiveChallenge) (*gossh.Permissions, error) {
+				return nil, ErrServerAuthCallbackConflict
 			}
-			return permissions, nil
+		} else {
+			config.KeyboardInteractiveCallback = func(conn gossh.ConnMetadata, challenger gossh.KeyboardInteractiveChallenge) (*gossh.Permissions, error) {
+				applyConnMetadata(ctx, conn)
+				permissions := beginAuthAttempt(ctx)
+				if ok := keyboardInteractiveHandler(ctx, challenger); !ok {
+					return permissions, ErrServerPermissionDenied
+				}
+				return permissions, nil
+			}
 		}
 	} else if config.KeyboardInteractiveCallback != nil {
 		config.KeyboardInteractiveCallback = wrapKeyboardInteractiveCallback(ctx, config.KeyboardInteractiveCallback)
@@ -450,8 +525,50 @@ func (srv *Server) config(ctx Context) *gossh.ServerConfig {
 func beginAuthAttempt(ctx Context) *gossh.Permissions {
 	permissions := &gossh.Permissions{}
 	publishAuthPermissions(ctx, permissions)
-	ctx.SetValue(ContextKeyPublicKey, nil)
 	return permissions
+}
+
+type publicKeyAuthState struct {
+	candidate PublicKey
+	pending   PublicKey
+}
+
+func (state *publicKeyAuthState) recordVerified(key PublicKey, err error) {
+	if err == nil {
+		state.candidate = key
+		return
+	}
+	if _, partial := err.(*gossh.PartialSuccessError); partial {
+		state.candidate = key
+		return
+	}
+	state.candidate = nil
+}
+
+func (state *publicKeyAuthState) finishAttempt(ctx Context, method string, err error) {
+	if method != "publickey" {
+		if err == nil && state.pending != nil {
+			ctx.SetValue(ContextKeyPublicKey, state.pending)
+		}
+		return
+	}
+	candidate := state.candidate
+	state.candidate = nil
+	if err == nil {
+		if candidate != nil {
+			state.pending = candidate
+			ctx.SetValue(ContextKeyPublicKey, candidate)
+		}
+		return
+	}
+	if _, partial := err.(*gossh.PartialSuccessError); partial {
+		state.pending = candidate
+		ctx.SetValue(ContextKeyPublicKey, candidate)
+		return
+	}
+	if state.pending == nil {
+		ctx.SetValue(ContextKeyPublicKey, nil)
+	}
 }
 
 func publishAuthPermissions(ctx Context, permissions *gossh.Permissions) {
@@ -523,17 +640,42 @@ func wrapAuthError(ctx Context, err error) error {
 }
 
 func wrapAuthCallbacks(ctx Context, callbacks gossh.ServerAuthCallbacks) gossh.ServerAuthCallbacks {
+	conflicts, _ := ctx.Value(contextKeyAuthConflicts).(authCallbackConflicts)
 	if callbacks.PasswordCallback != nil {
-		callbacks.PasswordCallback = wrapPasswordCallback(ctx, callbacks.PasswordCallback)
+		if conflicts.password {
+			callbacks.PasswordCallback = func(gossh.ConnMetadata, []byte) (*gossh.Permissions, error) {
+				return nil, ErrServerAuthCallbackConflict
+			}
+		} else {
+			callbacks.PasswordCallback = wrapPasswordCallback(ctx, callbacks.PasswordCallback)
+		}
 	}
 	if callbacks.PublicKeyCallback != nil {
-		callbacks.PublicKeyCallback = wrapPublicKeyCallback(ctx, callbacks.PublicKeyCallback)
+		if conflicts.publicKey {
+			callbacks.PublicKeyCallback = func(gossh.ConnMetadata, gossh.PublicKey) (*gossh.Permissions, error) {
+				return nil, ErrServerAuthCallbackConflict
+			}
+		} else {
+			callbacks.PublicKeyCallback = wrapPublicKeyCallback(ctx, callbacks.PublicKeyCallback)
+		}
 	}
 	if callbacks.KeyboardInteractiveCallback != nil {
-		callbacks.KeyboardInteractiveCallback = wrapKeyboardInteractiveCallback(ctx, callbacks.KeyboardInteractiveCallback)
+		if conflicts.keyboardInteractive {
+			callbacks.KeyboardInteractiveCallback = func(gossh.ConnMetadata, gossh.KeyboardInteractiveChallenge) (*gossh.Permissions, error) {
+				return nil, ErrServerAuthCallbackConflict
+			}
+		} else {
+			callbacks.KeyboardInteractiveCallback = wrapKeyboardInteractiveCallback(ctx, callbacks.KeyboardInteractiveCallback)
+		}
 	}
 	callbacks.GSSAPIWithMICConfig = wrapGSSAPIWithMICConfig(ctx, callbacks.GSSAPIWithMICConfig)
 	return callbacks
+}
+
+type authCallbackConflicts struct {
+	password            bool
+	publicKey           bool
+	keyboardInteractive bool
 }
 
 // Handle sets the Handler for the server.
@@ -653,18 +795,26 @@ func (srv *Server) Serve(l net.Listener) error {
 }
 
 func (srv *Server) HandleConn(newConn net.Conn) {
-	srv.waitForPreviousGeneration()
-	srv.configMu.Lock()
-	srv.ensureHandlers()
 	active := srv.trackActiveConn(newConn, true)
-	var settings *connectionSettings
-	if active != nil {
-		settings = srv.connectionSettings()
-	}
-	srv.configMu.Unlock()
 	if active == nil {
 		return
 	}
+	srv.configMu.Lock()
+	srv.ensureHandlers()
+	if err := srv.ensureHostSigner(); err != nil {
+		srv.mu.RLock()
+		connectionFailedCallback := srv.ConnectionFailedCallback
+		srv.mu.RUnlock()
+		srv.configMu.Unlock()
+		srv.untrackActiveConn(active)
+		closeQuietly(newConn)
+		if connectionFailedCallback != nil {
+			connectionFailedCallback(newConn, err)
+		}
+		return
+	}
+	settings := srv.connectionSettings()
+	srv.configMu.Unlock()
 	srv.handleConn(newConn, active, settings)
 }
 
@@ -734,7 +884,19 @@ func (srv *Server) handleConn(newConn net.Conn, active *activeConn, settings ...
 	}
 	conn.updateDeadline()
 	defer closeQuietly(conn)
-	sshConn, chans, reqs, err := gossh.NewServerConn(conn, srv.config(ctx))
+	serverConfig := srv.config(ctx)
+	if connectionSettings.requireClientAuth && !serverConfigHasClientAuth(serverConfig) {
+		err := ErrServerClientAuthRequired
+		srv.releaseStartup(active)
+		closeQuietly(conn)
+		srv.untrackActiveConn(active)
+		tracked = false
+		if connectionSettings.connectionFailedCallback != nil {
+			connectionSettings.connectionFailedCallback(conn, err)
+		}
+		return
+	}
+	sshConn, chans, reqs, err := gossh.NewServerConn(conn, serverConfig)
 	if err != nil {
 		srv.releaseStartup(active)
 		closeQuietly(conn)
@@ -812,6 +974,12 @@ func (srv *Server) handleConn(newConn net.Conn, active *activeConn, settings ...
 	cancel()
 	closeQuietly(sshConn)
 	workers.closeAndWait()
+}
+
+func serverConfigHasClientAuth(config *gossh.ServerConfig) bool {
+	return !config.NoClientAuth && (config.PasswordCallback != nil || config.PublicKeyCallback != nil ||
+		config.KeyboardInteractiveCallback != nil || config.GSSAPIWithMICConfig != nil &&
+		config.GSSAPIWithMICConfig.AllowLogin != nil && config.GSSAPIWithMICConfig.Server != nil)
 }
 
 type connectionChannelLimiter struct {
@@ -970,12 +1138,19 @@ func (srv *Server) AddHostKey(key Signer) {
 func (srv *Server) SetOption(option Option) error {
 	srv.configMu.Lock()
 	defer srv.configMu.Unlock()
-	srv.mu.RLock()
+	srv.mu.Lock()
 	running := len(srv.listeners) > 0 || len(srv.activeConns) > 0
-	srv.mu.RUnlock()
 	if running {
+		srv.mu.Unlock()
 		return ErrServerRunning
 	}
+	srv.configuring = true
+	srv.mu.Unlock()
+	defer func() {
+		srv.mu.Lock()
+		srv.configuring = false
+		srv.mu.Unlock()
+	}()
 	return option(srv)
 }
 
@@ -1061,6 +1236,14 @@ func (srv *Server) trackConn(c *gossh.ServerConn, add bool) {
 
 func (srv *Server) trackActiveConn(conn net.Conn, allowReset bool) *activeConn {
 	srv.mu.Lock()
+	if srv.configuring {
+		srv.mu.Unlock()
+		closeQuietly(conn)
+		return nil
+	}
+	if allowReset && len(srv.listeners) == 0 && len(srv.activeConns) == 0 {
+		srv.resetGenerationLocked()
+	}
 	if srv.doneChan != nil {
 		select {
 		case <-srv.doneChan:

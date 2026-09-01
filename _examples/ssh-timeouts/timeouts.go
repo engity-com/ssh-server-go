@@ -28,14 +28,14 @@ func main() {
 			}
 		}
 	})
-
-	log.Println("starting ssh server on port 2222...")
-	log.Printf("connections will only last %s\n", DeadlineTimeout)
-	log.Printf("and timeout after %s of no activity\n", IdleTimeout)
 	server := &ssh.Server{
-		Addr:        ":2222",
+		Addr:        "127.0.0.1:2222",
 		MaxTimeout:  &DeadlineTimeout,
 		IdleTimeout: &IdleTimeout,
 	}
+
+	log.Println("DEVELOPMENT ONLY: anonymous authentication and an ephemeral host key")
+	log.Println("starting ssh server on 127.0.0.1:2222...")
+	log.Printf("connections will only last %s and timeout after %s of no activity\n", DeadlineTimeout, IdleTimeout)
 	log.Fatal(server.ListenAndServe())
 }

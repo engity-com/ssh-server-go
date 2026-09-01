@@ -30,6 +30,14 @@ func main() {
 		}
 	})
 
-	log.Println("starting ssh server on port 2222...")
-	log.Fatal(ssh.ListenAndServe(":2222", nil))
+	server := &ssh.Server{
+		Addr: "127.0.0.1:2222",
+		AgentForwardingCallback: func(ssh.Context) bool {
+			return true
+		},
+	}
+
+	log.Println("DEVELOPMENT ONLY: anonymous authentication, agent forwarding, and an ephemeral host key")
+	log.Println("starting ssh server on 127.0.0.1:2222...")
+	log.Fatal(server.ListenAndServe())
 }

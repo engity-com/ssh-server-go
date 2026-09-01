@@ -8,9 +8,6 @@ import (
 )
 
 func main() {
-
-	log.Println("starting ssh server on port 2222...")
-
 	forwardHandler := &ssh.ForwardedTCPHandler{}
 
 	server := ssh.Server{
@@ -18,7 +15,7 @@ func main() {
 			log.Println("Accepted forward", dhost, dport)
 			return true
 		}),
-		Addr: ":2222",
+		Addr: "127.0.0.1:2222",
 		Handler: ssh.Handler(func(s ssh.Session) {
 			io.WriteString(s, "Remote forwarding available...\n")
 			select {}
@@ -33,5 +30,7 @@ func main() {
 		},
 	}
 
+	log.Println("DEVELOPMENT ONLY: anonymous authentication and an ephemeral host key")
+	log.Println("starting authenticated SSH server on 127.0.0.1:2222; connect with ssh -N -R ...")
 	log.Fatal(server.ListenAndServe())
 }

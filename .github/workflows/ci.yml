@@ -3,6 +3,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v*"
 
   pull_request:
     types:
@@ -11,16 +13,39 @@ on:
       - synchronize
       - ready_for_review
 
-  release:
-    types: [ published ]
-
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to be released (syntax: v<major>.<minor>.<patch>)"
-        required: true
+permissions:
+  contents: read
 
 jobs:
+  validate-release:
+    name: Validate release version
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate semantic version
+        env:
+          VERSION: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          if [[ ! "$VERSION" =~ ^v(0|1)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Invalid release version: $VERSION (this module supports v0 and v1 tags)" >&2
+            exit 1
+          fi
+
+      - name: Verify release commit belongs to main
+        shell: bash
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "Release commit does not belong to main" >&2
+            exit 1
+          fi
+
   test-go:
     name: Test Go code
     strategy:
@@ -29,18 +54,64 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install MISE
-        uses: jdx/mise-action@v4
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
 
       - name: Install dependencies
         run: mise run install:go
 
       - name: Test
         run: mise run test:go
+
+  race-go:
+    name: Test Go code with race detector
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install MISE
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+
+      - name: Install dependencies
+        run: mise run install:go
+
+      - name: Test with race detector
+        run: mise exec -- go test -race -count=1 ./...
+
+  test-examples:
+    name: Test example (${{ matrix.example }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        example:
+          - ssh-forwardagent
+          - ssh-pty
+          - ssh-publickey
+          - ssh-remoteforward
+          - ssh-sftpserver
+          - ssh-simple
+          - ssh-timeouts
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install MISE
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+
+      - name: Compile example
+        working-directory: _examples/${{ matrix.example }}
+        run: mise exec -- go test -mod=readonly ./...
 
   lint-go:
     name: "Lint Go code"
@@ -50,15 +121,17 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install MISE
-        uses: jdx/mise-action@v4
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
 
       - name: Install Go dependencies
         run: mise run install:go
 
       - name: Lint Go
         run: mise run lint:go
+

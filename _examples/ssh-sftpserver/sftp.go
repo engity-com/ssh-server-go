@@ -32,11 +32,13 @@ func SftpHandler(sess ssh.Session) {
 }
 
 func main() {
-	ssh_server := ssh.Server{
+	server := ssh.Server{
 		Addr: "127.0.0.1:2222",
 		SubsystemHandlers: map[string]ssh.SubsystemHandler{
 			"sftp": SftpHandler,
 		},
 	}
-	log.Fatal(ssh_server.ListenAndServe())
+	log.Println("DEVELOPMENT ONLY: anonymous authentication and an ephemeral host key")
+	log.Println("starting ssh server on 127.0.0.1:2222...")
+	log.Fatal(server.ListenAndServe())
 }

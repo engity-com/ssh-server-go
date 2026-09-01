@@ -3,6 +3,8 @@ package ssh
 import (
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestSetPermissions(t *testing.T) {
@@ -24,6 +26,18 @@ func TestSetPermissions(t *testing.T) {
 	if err := session.Run(""); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestContextMetadataGettersReturnZeroValuesBeforeHandshake(t *testing.T) {
+	ctx, cancel := newContext(nil)
+	defer cancel()
+
+	require.Empty(t, ctx.User())
+	require.Empty(t, ctx.SessionID())
+	require.Empty(t, ctx.ClientVersion())
+	require.Empty(t, ctx.ServerVersion())
+	require.Nil(t, ctx.LocalAddr())
+	require.Nil(t, ctx.RemoteAddr())
 }
 
 func TestSetValue(t *testing.T) {

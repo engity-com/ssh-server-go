@@ -62,6 +62,10 @@ type PtyCallback func(ctx Context, pty Pty) bool
 // SessionRequestCallback is a callback for allowing or denying SSH sessions.
 type SessionRequestCallback func(sess Session, requestType string) bool
 
+// AgentForwardingCallback is a hook for allowing agent forwarding per session.
+// A nil callback denies agent forwarding.
+type AgentForwardingCallback func(ctx Context) bool
+
 // ConnCallback is a hook for new connections before handling.
 // It allows wrapping for timeouts and limiting by returning
 // the net.Conn that will be used as the underlying connection.
@@ -77,7 +81,10 @@ type ReversePortForwardingCallback func(ctx Context, bindHost string, bindPort u
 
 // ServerConfigCallback customizes a fresh per-connection server config. Public
 // key multi-factor authentication must return PartialSuccessError from
-// VerifiedPublicKeyCallback, after key ownership has been proven.
+// VerifiedPublicKeyCallback, after key ownership has been proven. Configuring a
+// PasswordCallback, PublicKeyCallback, or KeyboardInteractiveCallback together
+// with the corresponding high-level Server handler rejects that auth method with
+// ErrServerAuthCallbackConflict rather than silently replacing either policy.
 type ServerConfigCallback func(ctx Context, config *gossh.ServerConfig)
 
 // ConnectionFailedCallback is a hook for reporting failed connections

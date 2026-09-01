@@ -1,4 +1,4 @@
-module github.com/engity-com/ssh-server-go/_examples/ssh-fortwardagent
+module github.com/engity-com/ssh-server-go/_examples/ssh-forwardagent
 
 go 1.27.0
 

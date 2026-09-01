@@ -6,6 +6,7 @@ import (
 	"os"
 	"path"
 	"sync"
+	"sync/atomic"
 
 	"github.com/echocat/slf4g"
 	"github.com/echocat/slf4g/names"
@@ -55,6 +56,26 @@ type agentListener struct {
 	dir string
 }
 
+type sessionAgentContext struct {
+	Context
+	requested atomic.Bool
+}
+
+func (ctx *sessionAgentContext) Value(key any) any {
+	if key == contextKeyAgentRequest {
+		return ctx.requested.Load()
+	}
+	return ctx.Context.Value(key)
+}
+
+func (ctx *sessionAgentContext) SetValue(key, value any) {
+	if key == contextKeyAgentRequest {
+		ctx.requested.Store(value == true)
+		return
+	}
+	ctx.Context.SetValue(key, value)
+}
+
 func (l *agentListener) Close() error {
 	return errors.Join(l.Listener.Close(), os.RemoveAll(l.dir))
 }
@@ -66,8 +87,20 @@ func ForwardAgentConnections(ln net.Listener, logger log.Logger, sess Session) {
 	if logger == nil {
 		logger = defaultForwardAgentConnectionsLoggerGetter()
 	}
+	if ln == nil || sess == nil {
+		logger.Error("cannot forward agent connections without a listener and session")
+		return
+	}
 	ctx := sess.Context()
-	sshConn := ctx.Value(ContextKeyConn).(gossh.Conn)
+	if ctx == nil {
+		logger.Error("cannot forward agent connections without a session context")
+		return
+	}
+	sshConn, ok := ctx.Value(ContextKeyConn).(gossh.Conn)
+	if !ok || sshConn == nil {
+		logger.Error("cannot forward agent connections outside a server-managed SSH connection")
+		return
+	}
 	limiter, _ := ctx.Value(contextKeyChannelLimiter).(*connectionChannelLimiter)
 	for {
 		conn, err := ln.Accept()
