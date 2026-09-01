@@ -1,6 +1,7 @@
 package ssh
 
 import (
+	"errors"
 	"net"
 	"os"
 	"path"
@@ -43,9 +44,19 @@ func NewAgentListener() (net.Listener, error) {
 	}
 	l, err := net.Listen("unix", path.Join(dir, agentListenFile))
 	if err != nil {
+		_ = os.RemoveAll(dir)
 		return nil, err
 	}
-	return l, nil
+	return &agentListener{Listener: l, dir: dir}, nil
+}
+
+type agentListener struct {
+	net.Listener
+	dir string
+}
+
+func (l *agentListener) Close() error {
+	return errors.Join(l.Listener.Close(), os.RemoveAll(l.dir))
 }
 
 // ForwardAgentConnections takes connections from a listener to proxy into the
@@ -57,6 +68,7 @@ func ForwardAgentConnections(ln net.Listener, logger log.Logger, sess Session) {
 	}
 	ctx := sess.Context()
 	sshConn := ctx.Value(ContextKeyConn).(gossh.Conn)
+	limiter, _ := ctx.Value(contextKeyChannelLimiter).(*connectionChannelLimiter)
 	for {
 		conn, err := ln.Accept()
 		if isClosedError(err) {
@@ -67,8 +79,14 @@ func ForwardAgentConnections(ln net.Listener, logger log.Logger, sess Session) {
 				Warnf("failed to listen for %s channel connections; closing...", agentChannelType)
 			return
 		}
-		go func(conn net.Conn) {
+		if !limiter.reserve() {
+			closeQuietly(conn)
+			logger.Warnf("too many open SSH channels; rejecting %s connection...", agentChannelType)
+			continue
+		}
+		if !startConnectionWorker(ctx, func() {
 			defer closeQuietly(conn)
+			defer limiter.release()
 			channel, reqs, err := sshConn.OpenChannel(agentChannelType, nil)
 			if err != nil {
 				logger.WithError(err).
@@ -82,7 +100,11 @@ func ForwardAgentConnections(ln net.Listener, logger log.Logger, sess Session) {
 					Warnf("failed to handle %s requests; closing...", agentChannelType)
 				return
 			}
-		}(conn)
+		}) {
+			limiter.release()
+			closeQuietly(conn)
+			return
+		}
 	}
 }
 

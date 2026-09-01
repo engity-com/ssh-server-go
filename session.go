@@ -90,10 +90,20 @@ type Session interface {
 // when there is no signal channel specified
 const maxSigBufSize = 128
 
+const (
+	maxSessionEnvVariables = 128
+	maxSessionEnvBytes     = 64 * 1024
+)
+
 func DefaultSessionHandler(srv *Server, conn *gossh.ServerConn, newChan gossh.NewChannel, ctx Context) {
+	settings := serverSettingsFromContext(ctx, srv)
 	ch, reqs, err := newChan.Accept()
 	if err != nil {
-		enrichLoggerForServerConnection(srv.logger(), conn).
+		logger := settings.logger
+		if logger == nil {
+			logger = srv.logger()
+		}
+		enrichLoggerForServerConnection(logger, conn).
 			WithError(err).
 			Warn("failed to accept new channel")
 		return
@@ -101,18 +111,20 @@ func DefaultSessionHandler(srv *Server, conn *gossh.ServerConn, newChan gossh.Ne
 	sess := &session{
 		Channel:           ch,
 		conn:              conn,
-		handler:           srv.Handler,
-		ptyCb:             srv.PtyCallback,
-		sessReqCb:         srv.SessionRequestCallback,
-		subsystemHandlers: srv.SubsystemHandlers,
+		handler:           settings.handler,
+		ptyCb:             settings.ptyCallback,
+		sessReqCb:         settings.sessionRequestCallback,
+		subsystemHandlers: settings.subsystemHandlers,
 		ctx:               ctx,
-		logger:            srv.Logger,
+		logger:            settings.logger,
 	}
 	sess.handleRequests(reqs)
 }
 
 type session struct {
 	sync.Mutex
+	sigConfigMu   sync.Mutex
+	breakConfigMu sync.Mutex
 	gossh.Channel
 	conn              *gossh.ServerConn
 	handler           Handler
@@ -122,6 +134,7 @@ type session struct {
 	pty               *Pty
 	winch             chan Window
 	env               []string
+	envBytes          int
 	ptyCb             PtyCallback
 	sessReqCb         SessionRequestCallback
 	rawCmd            string
@@ -129,7 +142,14 @@ type session struct {
 	ctx               Context
 	sigCh             chan<- Signal
 	sigBuf            []Signal
+	sigDrainCancel    chan struct{}
+	sigDrainDone      chan struct{}
+	sigSendCancel     chan struct{}
+	sigSendWg         sync.WaitGroup
 	breakCh           chan<- bool
+	breakSendCancel   chan struct{}
+	breakSendWg       sync.WaitGroup
+	breakSends        int
 	logger            log.Logger
 }
 
@@ -214,6 +234,8 @@ func (sess *session) Subsystem() string {
 }
 
 func (sess *session) Pty() (Pty, <-chan Window, bool) {
+	sess.Lock()
+	defer sess.Unlock()
 	if sess.pty != nil {
 		return *sess.pty, sess.winch, true
 	}
@@ -221,22 +243,136 @@ func (sess *session) Pty() (Pty, <-chan Window, bool) {
 }
 
 func (sess *session) Signals(c chan<- Signal) {
+	sess.sigConfigMu.Lock()
+	defer sess.sigConfigMu.Unlock()
+
 	sess.Lock()
-	defer sess.Unlock()
-	sess.sigCh = c
-	if len(sess.sigBuf) > 0 {
-		go func() {
-			for _, sig := range sess.sigBuf {
-				sess.sigCh <- sig
+	if sess.sigDrainCancel != nil {
+		close(sess.sigDrainCancel)
+		done := sess.sigDrainDone
+		sess.Unlock()
+		<-done
+		sess.Lock()
+	}
+	if sess.sigSendCancel != nil {
+		close(sess.sigSendCancel)
+		sess.sigSendCancel = nil
+	}
+	sess.sigCh = nil
+	sess.Unlock()
+	sess.sigSendWg.Wait()
+	sess.Lock()
+	if c == nil {
+		sess.Unlock()
+		return
+	}
+	if len(sess.sigBuf) == 0 {
+		sess.sigCh = c
+		sess.sigSendCancel = make(chan struct{})
+		sess.Unlock()
+		return
+	}
+	cancel := make(chan struct{})
+	done := make(chan struct{})
+	sess.sigDrainCancel = cancel
+	sess.sigDrainDone = done
+	sess.Unlock()
+	go sess.drainSignals(c, cancel, done)
+}
+
+func (sess *session) drainSignals(target chan<- Signal, cancel <-chan struct{}, done chan struct{}) {
+	defer func() {
+		sess.Lock()
+		if sess.sigDrainDone == done {
+			sess.sigDrainCancel = nil
+			sess.sigDrainDone = nil
+		}
+		sess.Unlock()
+		close(done)
+	}()
+	for {
+		sess.Lock()
+		buffered := append([]Signal(nil), sess.sigBuf...)
+		sess.sigBuf = nil
+		if len(buffered) == 0 {
+			sess.sigCh = target
+			sess.sigSendCancel = make(chan struct{})
+			sess.sigDrainCancel = nil
+			sess.sigDrainDone = nil
+			sess.Unlock()
+			return
+		}
+		sess.Unlock()
+
+		for i, sig := range buffered {
+			select {
+			case target <- sig:
+			case <-cancel:
+				sess.requeueSignals(buffered[i:])
+				return
+			case <-sess.ctx.Done():
+				return
 			}
-		}()
+		}
 	}
 }
 
-func (sess *session) Break(c chan<- bool) {
+func (sess *session) requeueSignals(signals []Signal) {
 	sess.Lock()
 	defer sess.Unlock()
-	sess.breakCh = c
+	signals = append(append([]Signal(nil), signals...), sess.sigBuf...)
+	if len(signals) > maxSigBufSize {
+		signals = signals[:maxSigBufSize]
+	}
+	sess.sigBuf = signals
+	sess.sigDrainCancel = nil
+	sess.sigDrainDone = nil
+}
+
+func (sess *session) Break(c chan<- bool) {
+	sess.breakConfigMu.Lock()
+	defer sess.breakConfigMu.Unlock()
+
+	sess.Lock()
+	if sess.breakSendCancel != nil {
+		close(sess.breakSendCancel)
+		sess.breakSendCancel = nil
+	}
+	sess.breakCh = nil
+	sess.Unlock()
+	sess.breakSendWg.Wait()
+	sess.Lock()
+	if c != nil {
+		sess.breakCh = c
+		sess.breakSendCancel = make(chan struct{})
+	}
+	sess.Unlock()
+}
+
+func (sess *session) deliverBreak() bool {
+	sess.Lock()
+	breakCh := sess.breakCh
+	breakSendCancel := sess.breakSendCancel
+	if breakCh != nil {
+		sess.breakSendWg.Add(1)
+		sess.breakSends++
+	}
+	sess.Unlock()
+	if breakCh == nil {
+		return false
+	}
+	delivered := false
+	select {
+	case breakCh <- true:
+		delivered = true
+	case <-breakSendCancel:
+	case <-sess.ctx.Done():
+	}
+	sess.Lock()
+	sess.breakSends--
+	sess.Unlock()
+	sess.breakSendWg.Done()
+	return delivered
 }
 
 func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
@@ -249,7 +385,7 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 	for req := range reqs {
 		switch req.Type {
 		case "shell", "exec":
-			if sess.handled {
+			if sess.handled || sess.handler == nil {
 				_ = req.Reply(false, nil)
 				continue
 			}
@@ -262,6 +398,7 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 				}
 			}
 			sess.rawCmd = payload.Value
+			sess.subsystem = ""
 
 			// If there's a session policy callback, we need to confirm before
 			// accepting the session.
@@ -274,10 +411,10 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 			sess.handled = true
 			_ = req.Reply(true, nil)
 
-			go func() {
+			startConnectionWorker(sess.ctx, func() {
 				sess.handler(sess)
 				_ = sess.Exit(0)
-			}()
+			})
 		case "subsystem":
 			if sess.handled {
 				_ = req.Reply(false, nil)
@@ -290,11 +427,12 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 				continue
 			}
 			sess.subsystem = payload.Value
+			sess.rawCmd = ""
 
 			// If there's a session policy callback, we need to confirm before
 			// accepting the session.
 			if sess.sessReqCb != nil && !sess.sessReqCb(sess, req.Type) {
-				sess.rawCmd = ""
+				sess.subsystem = ""
 				_ = req.Reply(false, nil)
 				continue
 			}
@@ -304,6 +442,7 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 				handler = sess.subsystemHandlers["default"]
 			}
 			if handler == nil {
+				sess.subsystem = ""
 				_ = req.Reply(false, nil)
 				continue
 			}
@@ -311,10 +450,10 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 			sess.handled = true
 			_ = req.Reply(true, nil)
 
-			go func() {
+			startConnectionWorker(sess.ctx, func() {
 				handler(sess)
 				_ = sess.Exit(0)
-			}()
+			})
 		case "env":
 			if sess.handled {
 				_ = req.Reply(false, nil)
@@ -325,7 +464,13 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 				_ = req.Reply(false, nil)
 				continue
 			}
+			envBytes := len(kv.Key) + 1 + len(kv.Value)
+			if len(sess.env) >= maxSessionEnvVariables || sess.envBytes+envBytes > maxSessionEnvBytes {
+				_ = req.Reply(false, nil)
+				continue
+			}
 			sess.env = append(sess.env, fmt.Sprintf("%s=%s", kv.Key, kv.Value))
+			sess.envBytes += envBytes
 			_ = req.Reply(true, nil)
 		case "signal":
 			var payload struct{ Signal string }
@@ -333,14 +478,30 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 				continue
 			}
 			sess.Lock()
-			if sess.sigCh != nil {
-				sess.sigCh <- Signal(payload.Signal)
-			} else {
+			sigCh := sess.sigCh
+			var sigSendCancel <-chan struct{}
+			if sigCh == nil {
 				if len(sess.sigBuf) < maxSigBufSize {
 					sess.sigBuf = append(sess.sigBuf, Signal(payload.Signal))
 				}
+			} else {
+				sigSendCancel = sess.sigSendCancel
+				sess.sigSendWg.Add(1)
 			}
 			sess.Unlock()
+			if sigCh != nil {
+				contextDone := false
+				select {
+				case sigCh <- Signal(payload.Signal):
+				case <-sigSendCancel:
+				case <-sess.ctx.Done():
+					contextDone = true
+				}
+				sess.sigSendWg.Done()
+				if contextDone {
+					return
+				}
+			}
 		case "pty-req":
 			if sess.handled || sess.pty != nil {
 				_ = req.Reply(false, nil)
@@ -369,8 +530,21 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 			}
 			win, ok := parseWinchRequest(req.Payload)
 			if ok {
+				sess.Lock()
 				sess.pty.Window = win
-				sess.winch <- win
+				select {
+				case sess.winch <- win:
+				default:
+					select {
+					case <-sess.winch:
+					default:
+					}
+					select {
+					case sess.winch <- win:
+					default:
+					}
+				}
+				sess.Unlock()
 			}
 			_ = req.Reply(ok, nil)
 		case agentRequestType:
@@ -378,18 +552,12 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 			SetAgentRequested(sess.ctx)
 			_ = req.Reply(true, nil)
 		case "break":
-			ok := false
-			sess.Lock()
-			if sess.breakCh != nil {
-				sess.breakCh <- true
-				ok = true
-			}
+			ok := sess.deliverBreak()
 			_ = req.Reply(ok, nil)
-			sess.Unlock()
 		default:
 			sess.getLogger().
 				With("request", req.Type).
-				Warn("unknown request")
+				Debug("unknown request")
 			_ = req.Reply(false, nil)
 		}
 	}

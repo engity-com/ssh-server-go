@@ -7,7 +7,9 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/stretchr/testify/require"
 	gossh "golang.org/x/crypto/ssh"
 )
 
@@ -82,4 +84,75 @@ func TestLocalPortForwardingRespectsCallback(t *testing.T) {
 	if !strings.Contains(err.Error(), "port forwarding is disabled") {
 		t.Fatalf("Expected permission error but got %#v", err)
 	}
+}
+
+func TestLocalPortForwardingHidesDialError(t *testing.T) {
+	target := newLocalListener()
+	addr := target.Addr().String()
+	closeQuietly(target)
+	_, client, cleanup := newTestSession(t, &Server{
+		Handler:                     func(Session) {},
+		LocalPortForwardingCallback: func(Context, string, uint32) bool { return true },
+	}, nil)
+	defer cleanup()
+
+	_, err := client.Dial("tcp", addr)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "connection failed")
+	require.NotContains(t, strings.ToLower(err.Error()), "refused")
+}
+
+func TestRemotePortZeroForwardIsRemovedOnCancel(t *testing.T) {
+	handler := &ForwardedTCPHandler{}
+	session, client, cleanup := newTestSession(t, &Server{
+		Handler:                       func(Session) {},
+		ReversePortForwardingCallback: func(Context, string, uint32) bool { return true },
+		RequestHandlers: map[string]RequestHandler{
+			"tcpip-forward":        handler.HandleSSHRequest,
+			"cancel-tcpip-forward": handler.HandleSSHRequest,
+		},
+	}, nil)
+	defer cleanup()
+	defer closeQuietly(session)
+
+	listener, err := client.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	handler.Lock()
+	require.Len(t, handler.forwards, 1)
+	handler.Unlock()
+	require.NoError(t, listener.Close())
+	require.Eventually(t, func() bool {
+		handler.Lock()
+		defer handler.Unlock()
+		return len(handler.forwards) == 0
+	}, time.Second, time.Millisecond)
+}
+
+func TestRemoteForwardListenerLimit(t *testing.T) {
+	maxForwards := 1
+	handler := &ForwardedTCPHandler{}
+	session, client, cleanup := newTestSession(t, &Server{
+		Handler:                         func(Session) {},
+		MaxReverseForwardsPerConnection: &maxForwards,
+		ReversePortForwardingCallback:   func(Context, string, uint32) bool { return true },
+		RequestHandlers: map[string]RequestHandler{
+			"tcpip-forward":        handler.HandleSSHRequest,
+			"cancel-tcpip-forward": handler.HandleSSHRequest,
+		},
+	}, nil)
+	defer cleanup()
+	defer closeQuietly(session)
+
+	first, err := client.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	_, err = client.Listen("tcp", "127.0.0.1:0")
+	require.Error(t, err)
+	require.NoError(t, first.Close())
+
+	var second net.Listener
+	require.Eventually(t, func() bool {
+		second, err = client.Listen("tcp", "127.0.0.1:0")
+		return err == nil
+	}, time.Second, time.Millisecond)
+	closeQuietly(second)
 }

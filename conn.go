@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/echocat/slf4g"
@@ -19,6 +20,7 @@ type serverConn struct {
 	handshakeDeadline time.Time
 	maxDeadline       time.Time
 	closeCanceler     context.CancelFunc
+	deadlineMu        sync.Mutex
 }
 
 func (c *serverConn) Write(p []byte) (n int, err error) {
@@ -52,6 +54,19 @@ func (c *serverConn) Close() (err error) {
 }
 
 func (c *serverConn) updateDeadline() {
+	c.deadlineMu.Lock()
+	defer c.deadlineMu.Unlock()
+	c.updateDeadlineLocked()
+}
+
+func (c *serverConn) clearHandshakeDeadline() {
+	c.deadlineMu.Lock()
+	defer c.deadlineMu.Unlock()
+	c.handshakeDeadline = time.Time{}
+	c.updateDeadlineLocked()
+}
+
+func (c *serverConn) updateDeadlineLocked() {
 	deadline := c.maxDeadline
 
 	if !c.handshakeDeadline.IsZero() && (deadline.IsZero() || c.handshakeDeadline.Before(deadline)) {

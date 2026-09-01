@@ -11,7 +11,10 @@ type closeWriter interface {
 	CloseWrite() error
 }
 
-// FullDuplexCopyOpts defines optional callbacks for observing a bidirectional copy.
+// FullDuplexCopyOpts defines optional callbacks for observing a bidirectional
+// copy. Callbacks are invoked asynchronously in event order on one observer
+// goroutine and cannot delay FullDuplexCopy. They must still return promptly to
+// avoid retaining that observer goroutine.
 type FullDuplexCopyOpts struct {
 	OnStart       func()
 	OnEnd         func(l2r, r2l int64, duration time.Duration, err error, wasInL2r *bool)
@@ -31,10 +34,27 @@ func FullDuplexCopy(ctx context.Context, left io.ReadWriteCloser, right io.ReadW
 	var errWasInL2r *bool
 	var l2r, r2l int64
 	started := time.Now()
+	observer := make(chan func(), 6)
+	go func() {
+		for callback := range observer {
+			func() {
+				defer func() { _ = recover() }()
+				callback()
+			}()
+		}
+	}()
+	observe := func(callback func()) {
+		if callback != nil {
+			observer <- callback
+		}
+	}
+	defer close(observer)
 	defer func() {
 		if opts != nil {
 			if f := opts.OnEnd; f != nil {
-				f(l2r, r2l, time.Since(started), rErr, errWasInL2r)
+				l2rFinal, r2lFinal := l2r, r2l
+				duration, errFinal, directionFinal := time.Since(started), rErr, errWasInL2r
+				observe(func() { f(l2rFinal, r2lFinal, duration, errFinal, directionFinal) })
 			}
 		}
 	}()
@@ -42,7 +62,7 @@ func FullDuplexCopy(ctx context.Context, left io.ReadWriteCloser, right io.ReadW
 	copyFull := func(from io.Reader, to io.Writer, isL2r bool) {
 		if opts != nil {
 			if f := opts.OnStreamStart; f != nil {
-				f(isL2r)
+				observe(func() { f(isL2r) })
 			}
 		}
 
@@ -63,19 +83,18 @@ func FullDuplexCopy(ctx context.Context, left io.ReadWriteCloser, right io.ReadW
 
 		if opts != nil {
 			if f := opts.OnStreamEnd; f != nil {
-				f(isL2r, err)
+				observe(func() { f(isL2r, err) })
 			}
 		}
 		dones <- done{wasL2r: isL2r, written: n, error: err}
 	}
-	go copyFull(right, left, false)
-	go copyFull(left, right, true)
-
 	if opts != nil {
 		if f := opts.OnStart; f != nil {
-			f()
+			observe(f)
 		}
 	}
+	go copyFull(right, left, false)
+	go copyFull(left, right, true)
 
 	closeStreams := sync.OnceFunc(func() {
 		closeQuietly(left)

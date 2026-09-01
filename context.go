@@ -16,6 +16,10 @@ type contextKey struct {
 }
 
 var (
+	contextKeyChannelLimiter    = &contextKey{"channel-limiter"}
+	contextKeyServerSettings    = &contextKey{"server-settings"}
+	contextKeyConnectionWorkers = &contextKey{"connection-workers"}
+
 	// ContextKeyUser is a context key for use with Contexts in this package.
 	// The associated value will be of type string.
 	ContextKeyUser = &contextKey{"user"}
@@ -56,6 +60,51 @@ var (
 	// The associated value will be of type PublicKey.
 	ContextKeyPublicKey = &contextKey{"public-key"}
 )
+
+type connectionWorkers struct {
+	mu     sync.Mutex
+	wg     sync.WaitGroup
+	closed bool
+}
+
+func (w *connectionWorkers) goRun(fn func()) bool {
+	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		return false
+	}
+	w.wg.Add(1)
+	w.mu.Unlock()
+	go func() {
+		defer w.wg.Done()
+		fn()
+	}()
+	return true
+}
+
+func (w *connectionWorkers) closeAndWait() {
+	w.mu.Lock()
+	w.closed = true
+	w.mu.Unlock()
+	w.wg.Wait()
+}
+
+func startConnectionWorker(ctx Context, fn func()) bool {
+	workers, _ := ctx.Value(contextKeyConnectionWorkers).(*connectionWorkers)
+	if workers == nil {
+		go fn()
+		return true
+	}
+	return workers.goRun(fn)
+}
+
+func serverSettingsFromContext(ctx Context, srv *Server) *connectionSettings {
+	settings, _ := ctx.Value(contextKeyServerSettings).(*connectionSettings)
+	if settings == nil {
+		settings = srv.fallbackConnectionSettings()
+	}
+	return settings
+}
 
 // Context is a package specific context interface. It exposes connection
 // metadata and allows new values to be easily written to it. It's used in
@@ -111,13 +160,14 @@ func newContext(srv *Server) (*sshContext, context.CancelFunc) {
 // this is separate from newContext because we will get ConnMetadata
 // at different points so it needs to be applied separately
 func applyConnMetadata(ctx Context, conn gossh.ConnMetadata) {
+	// The client may change the requested user between authentication attempts.
+	ctx.SetValue(ContextKeyUser, conn.User())
 	if ctx.Value(ContextKeySessionID) != nil {
 		return
 	}
 	ctx.SetValue(ContextKeySessionID, hex.EncodeToString(conn.SessionID()))
 	ctx.SetValue(ContextKeyClientVersion, string(conn.ClientVersion()))
 	ctx.SetValue(ContextKeyServerVersion, string(conn.ServerVersion()))
-	ctx.SetValue(ContextKeyUser, conn.User())
 	ctx.SetValue(ContextKeyLocalAddr, conn.LocalAddr())
 	ctx.SetValue(ContextKeyRemoteAddr, conn.RemoteAddr())
 }

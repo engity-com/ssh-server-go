@@ -7,7 +7,9 @@ import (
 	"io"
 	"net"
 	"testing"
+	"time"
 
+	"github.com/stretchr/testify/require"
 	gossh "golang.org/x/crypto/ssh"
 )
 
@@ -71,7 +73,11 @@ func newTestSession(t *testing.T, srv *Server, cfg *gossh.ClientConfig) (*gossh.
 			t.Error(err)
 		}
 	}()
-	return newClientSession(t, l.Addr().String(), cfg)
+	session, client, cleanup := newClientSession(t, l.Addr().String(), cfg)
+	return session, client, func() {
+		cleanup()
+		closeQuietly(l)
+	}
 }
 
 func TestStdout(t *testing.T) {
@@ -299,6 +305,181 @@ func TestPtyResize(t *testing.T) {
 	}
 	closeQuietly(session)
 	<-done
+}
+
+func TestPtyResizeDoesNotBlockWithoutConsumer(t *testing.T) {
+	session, _, cleanup := newTestSession(t, &Server{Handler: func(Session) {}}, nil)
+	defer cleanup()
+	require.NoError(t, session.RequestPty("xterm", 80, 40, gossh.TerminalModes{}))
+
+	result := make(chan error, 1)
+	go func() {
+		payload := gossh.Marshal(&struct{ Width, Height uint32 }{80, 160})
+		ok, err := session.SendRequest("window-change", true, payload)
+		if err == nil && !ok {
+			err = errors.New("window change rejected")
+		}
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("window change blocked without a consumer")
+	}
+}
+
+func TestPtyCanBeReadWhileWindowChanges(t *testing.T) {
+	started := make(chan struct{})
+	session, _, cleanup := newTestSession(t, &Server{Handler: func(s Session) {
+		close(started)
+		for {
+			select {
+			case <-s.Context().Done():
+				return
+			default:
+				s.Pty()
+			}
+		}
+	}}, nil)
+	defer cleanup()
+	require.NoError(t, session.RequestPty("xterm", 80, 40, gossh.TerminalModes{}))
+	require.NoError(t, session.Shell())
+	<-started
+	for i := range 100 {
+		payload := gossh.Marshal(&struct{ Width, Height uint32 }{uint32(80 + i), 160})
+		ok, err := session.SendRequest("window-change", true, payload)
+		require.NoError(t, err)
+		require.True(t, ok)
+	}
+}
+
+func TestSignalsUnregisterStopsBufferedDrain(t *testing.T) {
+	ctx, cancel := newContext(nil)
+	defer cancel()
+	sess := &session{ctx: ctx, sigBuf: []Signal{SIGINT, SIGTERM}}
+	blocked := make(chan Signal)
+	sess.Signals(blocked)
+	sess.Signals(nil)
+
+	signals := make(chan Signal, 2)
+	sess.Signals(signals)
+	require.Equal(t, SIGINT, <-signals)
+	require.Equal(t, SIGTERM, <-signals)
+}
+
+func TestBreakUnregisterStopsDelivery(t *testing.T) {
+	ctx, cancel := newContext(nil)
+	defer cancel()
+	sess := &session{ctx: ctx}
+	blocked := make(chan bool)
+	sess.Break(blocked)
+	result := make(chan bool, 1)
+	go func() { result <- sess.deliverBreak() }()
+	require.Eventually(t, func() bool {
+		sess.Lock()
+		defer sess.Unlock()
+		return sess.breakSends == 1
+	}, time.Second, time.Millisecond)
+	sess.Break(nil)
+	require.False(t, <-result)
+	close(blocked)
+}
+
+func TestSessionEnvironmentIsLimited(t *testing.T) {
+	session, _, cleanup := newTestSession(t, &Server{Handler: func(Session) {}}, nil)
+	defer cleanup()
+	for i := range maxSessionEnvVariables {
+		require.NoError(t, session.Setenv(fmt.Sprintf("KEY_%d", i), "value"))
+	}
+	require.Error(t, session.Setenv("ONE_TOO_MANY", "value"))
+}
+
+func TestRejectedSubsystemDoesNotLeakIntoShell(t *testing.T) {
+	session, _, cleanup := newTestSession(t, &Server{
+		Handler: func(s Session) {
+			_, _ = io.WriteString(s, s.Subsystem())
+		},
+		SessionRequestCallback: func(_ Session, requestType string) bool { return requestType != "subsystem" },
+	}, nil)
+	defer cleanup()
+	var stdout bytes.Buffer
+	session.Stdout = &stdout
+	require.Error(t, session.RequestSubsystem("forbidden"))
+	require.NoError(t, session.Run(""))
+	require.Empty(t, stdout.String())
+}
+
+func TestUnknownSubsystemDoesNotLeakIntoShell(t *testing.T) {
+	session, _, cleanup := newTestSession(t, &Server{Handler: func(s Session) {
+		_, _ = io.WriteString(s, s.Subsystem())
+	}}, nil)
+	defer cleanup()
+	var stdout bytes.Buffer
+	session.Stdout = &stdout
+	require.Error(t, session.RequestSubsystem("unknown"))
+	require.NoError(t, session.Run(""))
+	require.Empty(t, stdout.String())
+}
+
+func TestDefaultMaxSessionsPerConnection(t *testing.T) {
+	first, client, cleanup := newTestSession(t, &Server{Handler: func(Session) {}}, nil)
+	defer cleanup()
+	sessions := []*gossh.Session{first}
+	defer func() {
+		for _, session := range sessions {
+			closeQuietly(session)
+		}
+	}()
+	for range DefaultMaxSessionsPerConnection - 1 {
+		session, err := client.NewSession()
+		require.NoError(t, err)
+		sessions = append(sessions, session)
+	}
+	_, err := client.NewSession()
+	require.Error(t, err)
+}
+
+func TestMaxSessionsCanBeDisabled(t *testing.T) {
+	disabled := 0
+	first, client, cleanup := newTestSession(t, &Server{
+		Handler:                  func(Session) {},
+		MaxSessionsPerConnection: &disabled,
+	}, nil)
+	defer cleanup()
+	sessions := []*gossh.Session{first}
+	defer func() {
+		for _, session := range sessions {
+			closeQuietly(session)
+		}
+	}()
+	for range DefaultMaxSessionsPerConnection {
+		session, err := client.NewSession()
+		require.NoError(t, err)
+		sessions = append(sessions, session)
+	}
+}
+
+func TestMaxChannelsPerConnection(t *testing.T) {
+	maxChannels := 1
+	disabledSessions := 0
+	first, client, cleanup := newTestSession(t, &Server{
+		Handler:                  func(Session) {},
+		MaxSessionsPerConnection: &disabledSessions,
+		MaxChannelsPerConnection: &maxChannels,
+	}, nil)
+	defer cleanup()
+	defer closeQuietly(first)
+	_, err := client.NewSession()
+	require.Error(t, err)
+	require.NoError(t, first.Close())
+	var second *gossh.Session
+	require.Eventually(t, func() bool {
+		var err error
+		second, err = client.NewSession()
+		return err == nil
+	}, time.Second, time.Millisecond)
+	closeQuietly(second)
 }
 
 func TestSignals(t *testing.T) {

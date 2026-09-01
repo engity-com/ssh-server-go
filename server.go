@@ -3,9 +3,12 @@ package ssh
 import (
 	"context"
 	"errors"
+	"io"
 	"maps"
+	"math/rand/v2"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/echocat/slf4g"
@@ -18,7 +21,9 @@ var (
 	// after a call to [Server.Shutdown] or [Server.Close].
 	ErrServerClosed = errors.New("ssh: Server closed")
 
-	ErrServerPermissionDenied = errors.New("permission denied")
+	ErrServerPermissionDenied   = errors.New("permission denied")
+	ErrServerHostSignerRequired = errors.New("ssh: at least one persistent host signer is required")
+	ErrServerRunning            = errors.New("ssh: server configuration cannot be changed while running")
 )
 
 type SubsystemHandler func(s Session)
@@ -29,21 +34,48 @@ type RequestHandler func(ctx Context, srv *Server, req *gossh.Request) (ok bool,
 
 var DefaultRequestHandlers = map[string]RequestHandler{}
 
+// ChannelHandler handles one channel synchronously. It should not return until
+// ownership of the channel and its associated resources has ended.
 type ChannelHandler func(srv *Server, conn *gossh.ServerConn, newChan gossh.NewChannel, ctx Context)
 
 var DefaultChannelHandlers = map[string]ChannelHandler{
 	"session": DefaultSessionHandler,
 }
 
+const (
+	DefaultHandshakeTimeout                = 2 * time.Minute
+	DefaultIdleTimeout                     = time.Duration(0)
+	DefaultMaxTimeout                      = time.Duration(0)
+	DefaultMaxStartupsStart                = 10
+	DefaultMaxStartupsRate                 = 30
+	DefaultMaxStartupsFull                 = 100
+	DefaultMaxSessionsPerConnection        = 10
+	DefaultMaxChannelsPerConnection        = 64
+	DefaultMaxReverseForwardsPerConnection = 16
+	DefaultMaxConnections                  = 256
+	DefaultMaxChannels                     = 1024
+)
+
+// MaxStartupsConfig limits concurrent unauthenticated connections using the
+// OpenSSH start:rate:full random early-drop model.
+type MaxStartupsConfig struct {
+	Start int // number of unauthenticated connections before random early drop begins
+	Rate  int // initial drop probability in percent, clamped to 0..100
+	Full  int // hard limit for unauthenticated connections; nonpositive disables the limit
+}
+
 // Server defines parameters for running an SSH server. The zero value for
 // Server is a valid configuration. When both PasswordHandler and
-// PublicKeyHandler are nil, no client authentication is performed.
+// PublicKeyHandler are nil, no client authentication is performed. Public
+// fields and pointed-to configuration values must not be mutated while the
+// server is running; use synchronized methods for supported runtime updates.
 type Server struct {
 	Logger log.Logger
 
 	Addr                   string                 // TCP address to listen on, ":22" if empty
 	Handler                Handler                // handler to invoke, ssh.DefaultHandler if nil
 	HostSigners            []Signer               // private keys for the host key, must have at least one
+	RequireHostSigners     bool                   // reject startup without an explicitly configured host signer
 	Version                string                 // server version to be sent before the initial handshake
 	Banner                 string                 // server banner
 	Ciphers                Ciphers                // allowed ciphers, DefaultCiphers if empty
@@ -63,9 +95,21 @@ type Server struct {
 
 	ConnectionFailedCallback ConnectionFailedCallback // callback to report connection failures
 
-	HandshakeTimeout time.Duration // connection timeout until successful handshake, none if empty
-	IdleTimeout      time.Duration // connection timeout when no activity, none if empty
-	MaxTimeout       time.Duration // absolute connection timeout, none if empty
+	// Timeout fields use their Default* value when nil. A configured duration
+	// less than or equal to zero disables that timeout.
+	HandshakeTimeout *time.Duration // timeout until successful authentication, default 2 minutes
+	IdleTimeout      *time.Duration // timeout when no activity, disabled by default
+	MaxTimeout       *time.Duration // absolute connection timeout, disabled by default
+
+	// Limit fields use their Default* value when nil. A configured value less
+	// than or equal to zero disables that limit, meaning no limit is enforced.
+	// MaxStartups is disabled when Full is less than or equal to zero.
+	MaxStartups                     *MaxStartupsConfig
+	MaxSessionsPerConnection        *int
+	MaxChannelsPerConnection        *int
+	MaxReverseForwardsPerConnection *int
+	MaxConnections                  *int // authenticated connections across the server
+	MaxChannels                     *int // active channels across all connections
 
 	// ChannelHandlers allow overriding the built-in session handlers or provide
 	// extensions to the protocol, such as tcpip forwarding. By default, only the
@@ -81,12 +125,113 @@ type Server struct {
 	// handlers, but handle named subsystems.
 	SubsystemHandlers map[string]SubsystemHandler
 
-	listenerWg sync.WaitGroup
-	mu         sync.RWMutex
-	listeners  map[net.Listener]struct{}
-	conns      map[*gossh.ServerConn]struct{}
-	connWg     sync.WaitGroup
-	doneChan   chan struct{}
+	configMu                 sync.Mutex
+	mu                       sync.RWMutex
+	generatedHostKey         PublicKey
+	listeners                map[net.Listener]struct{}
+	conns                    map[*gossh.ServerConn]struct{}
+	activeConns              map[*activeConn]struct{}
+	startups                 int
+	authenticatedConnections *atomic.Int64
+	globalChannels           *atomic.Int64
+	doneChan                 chan struct{}
+	drainedChan              chan struct{}
+}
+
+type activeConn struct {
+	conn            net.Conn
+	cancel          context.CancelFunc
+	acceptedAt      time.Time
+	handshaking     bool
+	startupReserved bool
+	closed          bool
+}
+
+type connectionSettings struct {
+	logger                        log.Logger
+	connCallback                  ConnCallback
+	connectionFailedCallback      ConnectionFailedCallback
+	handler                       Handler
+	ptyCallback                   PtyCallback
+	sessionRequestCallback        SessionRequestCallback
+	localPortForwardingCallback   LocalPortForwardingCallback
+	reversePortForwardingCallback ReversePortForwardingCallback
+	channelHandlers               map[string]ChannelHandler
+	requestHandlers               map[string]RequestHandler
+	subsystemHandlers             map[string]SubsystemHandler
+	handshakeTimeout              time.Duration
+	idleTimeout                   time.Duration
+	maxTimeout                    time.Duration
+	maxConnections                int
+	maxChannels                   int
+	maxSessionsPerConnection      int
+	maxChannelsPerConnection      int
+	maxReverseForwards            int
+	authenticatedConnections      *atomic.Int64
+	globalChannels                *atomic.Int64
+}
+
+func (srv *Server) connectionSettings() *connectionSettings {
+	srv.mu.RLock()
+	defer srv.mu.RUnlock()
+	channelHandlers := maps.Clone(srv.ChannelHandlers)
+	if channelHandlers == nil {
+		channelHandlers = maps.Clone(DefaultChannelHandlers)
+	}
+	requestHandlers := maps.Clone(srv.RequestHandlers)
+	if requestHandlers == nil {
+		requestHandlers = maps.Clone(DefaultRequestHandlers)
+	}
+	subsystemHandlers := maps.Clone(srv.SubsystemHandlers)
+	if subsystemHandlers == nil {
+		subsystemHandlers = maps.Clone(DefaultSubsystemHandlers)
+	}
+	handler := srv.Handler
+	if handler == nil {
+		handler = getDefaultHandler()
+	}
+	return &connectionSettings{
+		logger:                        srv.Logger,
+		connCallback:                  srv.ConnCallback,
+		connectionFailedCallback:      srv.ConnectionFailedCallback,
+		handler:                       handler,
+		ptyCallback:                   srv.PtyCallback,
+		sessionRequestCallback:        srv.SessionRequestCallback,
+		localPortForwardingCallback:   srv.LocalPortForwardingCallback,
+		reversePortForwardingCallback: srv.ReversePortForwardingCallback,
+		channelHandlers:               channelHandlers,
+		requestHandlers:               requestHandlers,
+		subsystemHandlers:             subsystemHandlers,
+		handshakeTimeout:              configuredDuration(srv.HandshakeTimeout, DefaultHandshakeTimeout),
+		idleTimeout:                   configuredDuration(srv.IdleTimeout, DefaultIdleTimeout),
+		maxTimeout:                    configuredDuration(srv.MaxTimeout, DefaultMaxTimeout),
+		maxConnections:                configuredLimit(srv.MaxConnections, DefaultMaxConnections),
+		maxChannels:                   configuredLimit(srv.MaxChannels, DefaultMaxChannels),
+		maxSessionsPerConnection:      configuredLimit(srv.MaxSessionsPerConnection, DefaultMaxSessionsPerConnection),
+		maxChannelsPerConnection:      configuredLimit(srv.MaxChannelsPerConnection, DefaultMaxChannelsPerConnection),
+		maxReverseForwards:            configuredLimit(srv.MaxReverseForwardsPerConnection, DefaultMaxReverseForwardsPerConnection),
+		authenticatedConnections:      srv.authenticatedConnections,
+		globalChannels:                srv.globalChannels,
+	}
+}
+
+func (srv *Server) fallbackConnectionSettings() *connectionSettings {
+	srv.mu.RLock()
+	defer srv.mu.RUnlock()
+	handler := srv.Handler
+	if handler == nil {
+		handler = getDefaultHandler()
+	}
+	return &connectionSettings{
+		logger:                        srv.Logger,
+		handler:                       handler,
+		ptyCallback:                   srv.PtyCallback,
+		sessionRequestCallback:        srv.SessionRequestCallback,
+		localPortForwardingCallback:   srv.LocalPortForwardingCallback,
+		reversePortForwardingCallback: srv.ReversePortForwardingCallback,
+		subsystemHandlers:             maps.Clone(srv.SubsystemHandlers),
+		maxReverseForwards:            configuredLimit(srv.MaxReverseForwardsPerConnection, DefaultMaxReverseForwardsPerConnection),
+	}
 }
 
 func (srv *Server) ensureHostSigner() error {
@@ -94,13 +239,31 @@ func (srv *Server) ensureHostSigner() error {
 	defer srv.mu.Unlock()
 
 	if len(srv.HostSigners) == 0 {
+		if srv.RequireHostSigners {
+			return ErrServerHostSignerRequired
+		}
 		signer, err := generateSigner()
 		if err != nil {
 			return err
 		}
 		srv.HostSigners = append(srv.HostSigners, signer)
+		srv.generatedHostKey = signer.PublicKey()
+	} else if srv.RequireHostSigners && srv.onlyGeneratedHostSignersLocked() {
+		return ErrServerHostSignerRequired
 	}
 	return nil
+}
+
+func (srv *Server) onlyGeneratedHostSignersLocked() bool {
+	if srv.generatedHostKey == nil {
+		return false
+	}
+	for _, signer := range srv.HostSigners {
+		if !KeysEqual(signer.PublicKey(), srv.generatedHostKey) {
+			return false
+		}
+	}
+	return true
 }
 
 func (srv *Server) ensureHandlers() {
@@ -125,20 +288,31 @@ func (srv *Server) ensureHandlers() {
 			srv.SubsystemHandlers = map[string]SubsystemHandler{}
 		}
 	}
+	if srv.Handler == nil {
+		srv.Handler = getDefaultHandler()
+	}
 }
 
 func (srv *Server) config(ctx Context) *gossh.ServerConfig {
 	srv.mu.RLock()
-	defer srv.mu.RUnlock()
+	serverConfigCallback := srv.ServerConfigCallback
+	ciphers := append(Ciphers(nil), srv.Ciphers...)
+	keyExchanges := append(KeyExchanges(nil), srv.KeyExchanges...)
+	messageAuthentications := append(MessageAuthentications(nil), srv.MessageAuthentications...)
+	hostSigners := append([]Signer(nil), srv.HostSigners...)
+	passwordHandler := srv.PasswordHandler
+	publicKeyHandler := srv.PublicKeyHandler
+	keyboardInteractiveHandler := srv.KeyboardInteractiveHandler
+	version := srv.Version
+	banner := srv.Banner
+	bannerHandler := srv.BannerHandler
+	srv.mu.RUnlock()
 
-	var config *gossh.ServerConfig
-	if srv.ServerConfigCallback == nil {
-		config = &gossh.ServerConfig{}
-	} else {
-		config = srv.ServerConfigCallback(ctx)
+	config := &gossh.ServerConfig{}
+	if serverConfigCallback != nil {
+		serverConfigCallback(ctx, config)
 	}
-	if !srv.Ciphers.IsEmpty() || len(config.Ciphers) == 0 {
-		ciphers := srv.Ciphers
+	if !ciphers.IsEmpty() || len(config.Ciphers) == 0 {
 		if ciphers.IsEmpty() {
 			ciphers = DefaultCiphers
 		}
@@ -147,8 +321,7 @@ func (srv *Server) config(ctx Context) *gossh.ServerConfig {
 			config.Ciphers[i] = cipher.String()
 		}
 	}
-	if !srv.KeyExchanges.IsEmpty() || len(config.KeyExchanges) == 0 {
-		keyExchanges := srv.KeyExchanges
+	if !keyExchanges.IsEmpty() || len(config.KeyExchanges) == 0 {
 		if keyExchanges.IsEmpty() {
 			keyExchanges = DefaultKeyExchanges
 		}
@@ -157,8 +330,7 @@ func (srv *Server) config(ctx Context) *gossh.ServerConfig {
 			config.KeyExchanges[i] = keyExchange.String()
 		}
 	}
-	if !srv.MessageAuthentications.IsEmpty() || len(config.MACs) == 0 {
-		messageAuthentications := srv.MessageAuthentications
+	if !messageAuthentications.IsEmpty() || len(config.MACs) == 0 {
 		if messageAuthentications.IsEmpty() {
 			messageAuthentications = DefaultMessageAuthentications
 		}
@@ -167,55 +339,201 @@ func (srv *Server) config(ctx Context) *gossh.ServerConfig {
 			config.MACs[i] = messageAuthentication.String()
 		}
 	}
-	for _, signer := range srv.HostSigners {
+	for _, signer := range hostSigners {
 		config.AddHostKey(signer)
 	}
-	if srv.PasswordHandler == nil && srv.PublicKeyHandler == nil && srv.KeyboardInteractiveHandler == nil {
+	if passwordHandler == nil && publicKeyHandler == nil && keyboardInteractiveHandler == nil &&
+		config.PasswordCallback == nil && config.PublicKeyCallback == nil &&
+		config.KeyboardInteractiveCallback == nil && config.GSSAPIWithMICConfig == nil {
 		config.NoClientAuth = true
 	}
-	if srv.Version != "" {
-		config.ServerVersion = "SSH-2.0-" + srv.Version
+	if version != "" {
+		config.ServerVersion = "SSH-2.0-" + version
 	}
-	if srv.Banner != "" {
+	if banner != "" {
 		config.BannerCallback = func(_ gossh.ConnMetadata) string {
-			return srv.Banner
+			return banner
 		}
 	}
-	if srv.BannerHandler != nil {
+	if bannerHandler != nil {
 		config.BannerCallback = func(conn gossh.ConnMetadata) string {
 			applyConnMetadata(ctx, conn)
-			return srv.BannerHandler(ctx)
+			return bannerHandler(ctx)
 		}
 	}
-	if srv.PasswordHandler != nil {
+	if config.NoClientAuth {
+		noClientAuthCallback := config.NoClientAuthCallback
+		config.NoClientAuthCallback = func(conn gossh.ConnMetadata) (*gossh.Permissions, error) {
+			applyConnMetadata(ctx, conn)
+			permissions := beginAuthAttempt(ctx)
+			if noClientAuthCallback != nil {
+				var err error
+				permissions, err = noClientAuthCallback(conn)
+				if err != nil {
+					return permissions, wrapAuthError(ctx, err)
+				}
+			}
+			publishAuthPermissions(ctx, permissions)
+			return permissions, nil
+		}
+	}
+	if passwordHandler != nil {
 		config.PasswordCallback = func(conn gossh.ConnMetadata, password []byte) (*gossh.Permissions, error) {
 			applyConnMetadata(ctx, conn)
-			if ok := srv.PasswordHandler(ctx, string(password)); !ok {
-				return ctx.Permissions().Permissions, ErrServerPermissionDenied
+			permissions := beginAuthAttempt(ctx)
+			if ok := passwordHandler(ctx, string(password)); !ok {
+				return permissions, ErrServerPermissionDenied
 			}
-			return ctx.Permissions().Permissions, nil
+			return permissions, nil
 		}
+	} else if config.PasswordCallback != nil {
+		config.PasswordCallback = wrapPasswordCallback(ctx, config.PasswordCallback)
 	}
-	if srv.PublicKeyHandler != nil {
+	if publicKeyHandler != nil {
+		verifiedPublicKeyCallback := config.VerifiedPublicKeyCallback
 		config.PublicKeyCallback = func(conn gossh.ConnMetadata, key gossh.PublicKey) (*gossh.Permissions, error) {
 			applyConnMetadata(ctx, conn)
-			if ok := srv.PublicKeyHandler(ctx, key); !ok {
-				return ctx.Permissions().Permissions, ErrServerPermissionDenied
+			permissions := beginAuthAttempt(ctx)
+			if ok := publicKeyHandler(ctx, key); !ok {
+				return permissions, ErrServerPermissionDenied
 			}
+			return permissions, nil
+		}
+		config.VerifiedPublicKeyCallback = func(conn gossh.ConnMetadata, key gossh.PublicKey, permissions *gossh.Permissions, signatureAlgorithm string) (*gossh.Permissions, error) {
+			applyConnMetadata(ctx, conn)
+			if verifiedPublicKeyCallback != nil {
+				var err error
+				permissions, err = verifiedPublicKeyCallback(conn, key, permissions, signatureAlgorithm)
+				if err != nil {
+					return permissions, wrapAuthError(ctx, err)
+				}
+			}
+			if permissions == nil {
+				permissions = &gossh.Permissions{}
+			}
+			ctx.SetValue(ContextKeyPermissions, &Permissions{permissions})
 			ctx.SetValue(ContextKeyPublicKey, key)
-			return ctx.Permissions().Permissions, nil
+			return permissions, nil
+		}
+	} else if config.PublicKeyCallback != nil {
+		config.PublicKeyCallback = wrapPublicKeyCallback(ctx, config.PublicKeyCallback)
+		verifiedPublicKeyCallback := config.VerifiedPublicKeyCallback
+		config.VerifiedPublicKeyCallback = func(conn gossh.ConnMetadata, key gossh.PublicKey, permissions *gossh.Permissions, signatureAlgorithm string) (*gossh.Permissions, error) {
+			applyConnMetadata(ctx, conn)
+			if verifiedPublicKeyCallback != nil {
+				permissions, err := verifiedPublicKeyCallback(conn, key, permissions, signatureAlgorithm)
+				if err != nil {
+					return permissions, wrapAuthError(ctx, err)
+				}
+			}
+			publishAuthPermissions(ctx, permissions)
+			ctx.SetValue(ContextKeyPublicKey, key)
+			return permissions, nil
 		}
 	}
-	if srv.KeyboardInteractiveHandler != nil {
+	if keyboardInteractiveHandler != nil {
 		config.KeyboardInteractiveCallback = func(conn gossh.ConnMetadata, challenger gossh.KeyboardInteractiveChallenge) (*gossh.Permissions, error) {
 			applyConnMetadata(ctx, conn)
-			if ok := srv.KeyboardInteractiveHandler(ctx, challenger); !ok {
-				return ctx.Permissions().Permissions, ErrServerPermissionDenied
+			permissions := beginAuthAttempt(ctx)
+			if ok := keyboardInteractiveHandler(ctx, challenger); !ok {
+				return permissions, ErrServerPermissionDenied
 			}
-			return ctx.Permissions().Permissions, nil
+			return permissions, nil
 		}
+	} else if config.KeyboardInteractiveCallback != nil {
+		config.KeyboardInteractiveCallback = wrapKeyboardInteractiveCallback(ctx, config.KeyboardInteractiveCallback)
 	}
+	config.GSSAPIWithMICConfig = wrapGSSAPIWithMICConfig(ctx, config.GSSAPIWithMICConfig)
 	return config
+}
+
+func beginAuthAttempt(ctx Context) *gossh.Permissions {
+	permissions := &gossh.Permissions{}
+	publishAuthPermissions(ctx, permissions)
+	ctx.SetValue(ContextKeyPublicKey, nil)
+	return permissions
+}
+
+func publishAuthPermissions(ctx Context, permissions *gossh.Permissions) {
+	if permissions == nil {
+		permissions = &gossh.Permissions{}
+	}
+	ctx.SetValue(ContextKeyPermissions, &Permissions{permissions})
+}
+
+func wrapPasswordCallback(ctx Context, callback func(gossh.ConnMetadata, []byte) (*gossh.Permissions, error)) func(gossh.ConnMetadata, []byte) (*gossh.Permissions, error) {
+	return func(conn gossh.ConnMetadata, password []byte) (*gossh.Permissions, error) {
+		applyConnMetadata(ctx, conn)
+		beginAuthAttempt(ctx)
+		permissions, err := callback(conn, password)
+		if err == nil {
+			publishAuthPermissions(ctx, permissions)
+		}
+		return permissions, wrapAuthError(ctx, err)
+	}
+}
+
+func wrapPublicKeyCallback(ctx Context, callback func(gossh.ConnMetadata, gossh.PublicKey) (*gossh.Permissions, error)) func(gossh.ConnMetadata, gossh.PublicKey) (*gossh.Permissions, error) {
+	return func(conn gossh.ConnMetadata, key gossh.PublicKey) (*gossh.Permissions, error) {
+		applyConnMetadata(ctx, conn)
+		beginAuthAttempt(ctx)
+		permissions, err := callback(conn, key)
+		return permissions, wrapAuthError(ctx, err)
+	}
+}
+
+func wrapKeyboardInteractiveCallback(ctx Context, callback func(gossh.ConnMetadata, gossh.KeyboardInteractiveChallenge) (*gossh.Permissions, error)) func(gossh.ConnMetadata, gossh.KeyboardInteractiveChallenge) (*gossh.Permissions, error) {
+	return func(conn gossh.ConnMetadata, challenger gossh.KeyboardInteractiveChallenge) (*gossh.Permissions, error) {
+		applyConnMetadata(ctx, conn)
+		beginAuthAttempt(ctx)
+		permissions, err := callback(conn, challenger)
+		if err == nil {
+			publishAuthPermissions(ctx, permissions)
+		}
+		return permissions, wrapAuthError(ctx, err)
+	}
+}
+
+func wrapGSSAPIWithMICConfig(ctx Context, config *gossh.GSSAPIWithMICConfig) *gossh.GSSAPIWithMICConfig {
+	if config == nil || config.AllowLogin == nil {
+		return config
+	}
+	result := *config
+	allowLogin := config.AllowLogin
+	result.AllowLogin = func(conn gossh.ConnMetadata, srcName string) (*gossh.Permissions, error) {
+		applyConnMetadata(ctx, conn)
+		beginAuthAttempt(ctx)
+		permissions, err := allowLogin(conn, srcName)
+		if err == nil {
+			publishAuthPermissions(ctx, permissions)
+		}
+		return permissions, wrapAuthError(ctx, err)
+	}
+	return &result
+}
+
+func wrapAuthError(ctx Context, err error) error {
+	partial, ok := err.(*gossh.PartialSuccessError)
+	if !ok {
+		return err
+	}
+	result := *partial
+	result.Next = wrapAuthCallbacks(ctx, partial.Next)
+	return &result
+}
+
+func wrapAuthCallbacks(ctx Context, callbacks gossh.ServerAuthCallbacks) gossh.ServerAuthCallbacks {
+	if callbacks.PasswordCallback != nil {
+		callbacks.PasswordCallback = wrapPasswordCallback(ctx, callbacks.PasswordCallback)
+	}
+	if callbacks.PublicKeyCallback != nil {
+		callbacks.PublicKeyCallback = wrapPublicKeyCallback(ctx, callbacks.PublicKeyCallback)
+	}
+	if callbacks.KeyboardInteractiveCallback != nil {
+		callbacks.KeyboardInteractiveCallback = wrapKeyboardInteractiveCallback(ctx, callbacks.KeyboardInteractiveCallback)
+	}
+	callbacks.GSSAPIWithMICConfig = wrapGSSAPIWithMICConfig(ctx, callbacks.GSSAPIWithMICConfig)
+	return callbacks
 }
 
 // Handle sets the Handler for the server.
@@ -233,13 +551,29 @@ func (srv *Server) Handle(fn Handler) {
 // underlying Listener(s).
 func (srv *Server) Close() error {
 	srv.mu.Lock()
-	defer srv.mu.Unlock()
-
 	srv.closeDoneChanLocked()
-	err := srv.closeListenersLocked()
+	listeners := srv.listenersLocked()
+	connections := make([]io.Closer, 0, len(srv.conns)+len(srv.activeConns))
 	for c := range srv.conns {
-		closeQuietly(c)
-		delete(srv.conns, c)
+		connections = append(connections, c)
+	}
+	cancels := make([]context.CancelFunc, 0, len(srv.activeConns))
+	for c := range srv.activeConns {
+		c.closed = true
+		if c.cancel != nil {
+			cancels = append(cancels, c.cancel)
+		}
+		connections = append(connections, c.conn)
+	}
+	srv.maybeCloseDrainedLocked()
+	srv.mu.Unlock()
+
+	for _, cancel := range cancels {
+		cancel()
+	}
+	err := closeListeners(listeners)
+	for _, conn := range connections {
+		closeQuietly(conn)
 	}
 	return err
 }
@@ -251,21 +585,16 @@ func (srv *Server) Close() error {
 // then the context's error is returned.
 func (srv *Server) Shutdown(ctx context.Context) error {
 	srv.mu.Lock()
-	err := srv.closeListenersLocked()
 	srv.closeDoneChanLocked()
+	listeners := srv.listenersLocked()
+	drained := srv.getDrainedChanLocked()
 	srv.mu.Unlock()
-
-	finished := make(chan struct{}, 1)
-	go func() {
-		srv.listenerWg.Wait()
-		srv.connWg.Wait()
-		finished <- struct{}{}
-	}()
+	err := closeListeners(listeners)
 
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-finished:
+	case <-drained:
 		return err
 	}
 }
@@ -276,17 +605,24 @@ func (srv *Server) Shutdown(ctx context.Context) error {
 //
 // Serve always returns a non-nil error.
 func (srv *Server) Serve(l net.Listener) error {
-	srv.ensureHandlers()
+	for {
+		srv.waitForPreviousGeneration()
+		srv.configMu.Lock()
+		srv.ensureHandlers()
+		if err := srv.ensureHostSigner(); err != nil {
+			srv.configMu.Unlock()
+			closeQuietly(l)
+			return err
+		}
+		if srv.trackListener(l, true) {
+			srv.configMu.Unlock()
+			break
+		}
+		srv.configMu.Unlock()
+	}
 	defer closeQuietly(l)
-	if err := srv.ensureHostSigner(); err != nil {
-		return err
-	}
-	if srv.Handler == nil {
-		srv.Handler = DefaultHandler
-	}
 	var tempDelay time.Duration
 
-	srv.trackListener(l, true)
 	defer srv.trackListener(l, false)
 	for {
 		conn, e := l.Accept()
@@ -310,67 +646,270 @@ func (srv *Server) Serve(l net.Listener) error {
 			}
 			return e
 		}
-		go srv.HandleConn(conn)
+		if active := srv.trackActiveConn(conn, false); active != nil {
+			go srv.handleConn(conn, active)
+		}
 	}
 }
 
 func (srv *Server) HandleConn(newConn net.Conn) {
+	srv.waitForPreviousGeneration()
+	srv.configMu.Lock()
+	srv.ensureHandlers()
+	active := srv.trackActiveConn(newConn, true)
+	var settings *connectionSettings
+	if active != nil {
+		settings = srv.connectionSettings()
+	}
+	srv.configMu.Unlock()
+	if active == nil {
+		return
+	}
+	srv.handleConn(newConn, active, settings)
+}
+
+func (srv *Server) handleConn(newConn net.Conn, active *activeConn, settings ...*connectionSettings) {
+	tracked := true
+	defer func() {
+		if tracked {
+			srv.untrackActiveConn(active)
+		}
+	}()
 	ctx, cancel := newContext(srv)
-	if srv.ConnCallback != nil {
-		cbConn := srv.ConnCallback(ctx, newConn)
+	defer cancel()
+	connectionSettings := srv.connectionSettings()
+	if len(settings) > 0 {
+		connectionSettings = settings[0]
+	}
+	ctx.SetValue(contextKeyServerSettings, connectionSettings)
+	if !srv.updateActiveCancel(active, cancel) {
+		closeQuietly(newConn)
+		return
+	}
+	handshakeTimeout := connectionSettings.handshakeTimeout
+	var handshakeDeadline time.Time
+	if handshakeTimeout > 0 {
+		handshakeDeadline = active.acceptedAt.Add(handshakeTimeout)
+	}
+	maxTimeout := connectionSettings.maxTimeout
+	var maxDeadline time.Time
+	if maxTimeout > 0 {
+		maxDeadline = active.acceptedAt.Add(maxTimeout)
+	}
+	handshakeTimer := cancelAt(handshakeDeadline, func() {
+		srv.mu.RLock()
+		handshaking := active.handshaking
+		srv.mu.RUnlock()
+		if handshaking {
+			cancel()
+		}
+	})
+	if handshakeTimer != nil {
+		defer handshakeTimer.Stop()
+	}
+	maxTimer := cancelAt(maxDeadline, cancel)
+	if maxTimer != nil {
+		defer maxTimer.Stop()
+	}
+	_ = newConn.SetDeadline(earliestDeadline(handshakeDeadline, maxDeadline))
+	if connectionSettings.connCallback != nil {
+		cbConn := connectionSettings.connCallback(ctx, newConn)
 		if cbConn == nil {
 			closeQuietly(newConn)
 			return
 		}
 		newConn = cbConn
+		if !srv.updateActiveConn(active, cbConn) {
+			closeQuietly(cbConn)
+			return
+		}
 	}
+	idleTimeout := connectionSettings.idleTimeout
 	conn := &serverConn{
-		Conn:          newConn,
-		idleTimeout:   srv.IdleTimeout,
-		closeCanceler: cancel,
-	}
-	if srv.MaxTimeout > 0 {
-		conn.maxDeadline = time.Now().Add(srv.MaxTimeout)
-	}
-	if srv.HandshakeTimeout > 0 {
-		conn.handshakeDeadline = time.Now().Add(srv.HandshakeTimeout)
+		Conn:              newConn,
+		idleTimeout:       idleTimeout,
+		handshakeDeadline: handshakeDeadline,
+		maxDeadline:       maxDeadline,
+		closeCanceler:     cancel,
 	}
 	conn.updateDeadline()
 	defer closeQuietly(conn)
 	sshConn, chans, reqs, err := gossh.NewServerConn(conn, srv.config(ctx))
 	if err != nil {
-		if srv.ConnectionFailedCallback != nil {
-			srv.ConnectionFailedCallback(conn, err)
+		srv.releaseStartup(active)
+		closeQuietly(conn)
+		srv.untrackActiveConn(active)
+		tracked = false
+		if connectionSettings.connectionFailedCallback != nil {
+			connectionSettings.connectionFailedCallback(conn, err)
 		}
 		return
 	}
-	conn.handshakeDeadline = time.Time{}
-	conn.updateDeadline()
+	srv.releaseStartup(active)
+	connectionLimiter := resourceLimiter{
+		limit:  int64(connectionSettings.maxConnections),
+		active: connectionSettings.authenticatedConnections,
+	}
+	if !connectionLimiter.reserve() {
+		return
+	}
+	defer connectionLimiter.release()
+	if handshakeTimer != nil {
+		handshakeTimer.Stop()
+	}
+	conn.clearHandshakeDeadline()
 	srv.trackConn(sshConn, true)
 	defer srv.trackConn(sshConn, false)
 
 	ctx.SetValue(ContextKeyConn, sshConn)
 	applyConnMetadata(ctx, sshConn)
-	//go gossh.DiscardRequests(reqs)
-	go srv.handleRequests(ctx, reqs)
+	publishAuthPermissions(ctx, sshConn.Permissions)
+	maxSessions := connectionSettings.maxSessionsPerConnection
+	maxChannels := connectionSettings.maxChannelsPerConnection
+	globalChannelLimiter := &resourceLimiter{
+		limit:  int64(connectionSettings.maxChannels),
+		active: connectionSettings.globalChannels,
+	}
+	channelLimiter := &connectionChannelLimiter{limit: int64(maxChannels), global: globalChannelLimiter}
+	ctx.SetValue(contextKeyChannelLimiter, channelLimiter)
+	workers := &connectionWorkers{}
+	ctx.SetValue(contextKeyConnectionWorkers, workers)
+	workers.goRun(func() {
+		srv.handleRequests(ctx, reqs, connectionSettings.requestHandlers)
+	})
+	var activeSessions atomic.Int64
 	for ch := range chans {
-		handler := srv.ChannelHandlers[ch.ChannelType()]
+		handler := connectionSettings.channelHandlers[ch.ChannelType()]
 		if handler == nil {
-			handler = srv.ChannelHandlers["default"]
+			handler = connectionSettings.channelHandlers["default"]
 		}
 		if handler == nil {
 			_ = ch.Reject(gossh.UnknownChannelType, "unsupported channel type")
 			continue
 		}
-		go handler(srv, sshConn, ch, ctx)
+		if !channelLimiter.reserve() {
+			_ = ch.Reject(gossh.ResourceShortage, "too many open channels")
+			continue
+		}
+		isSession := ch.ChannelType() == "session"
+		sessionReserved := !isSession || maxSessions <= 0 || activeSessions.Add(1) <= int64(maxSessions)
+		if !sessionReserved {
+			activeSessions.Add(-1)
+			channelLimiter.release()
+			_ = ch.Reject(gossh.ResourceShortage, "too many open sessions")
+			continue
+		}
+		workers.goRun(func() {
+			defer func() {
+				if isSession && maxSessions > 0 {
+					activeSessions.Add(-1)
+				}
+				channelLimiter.release()
+			}()
+			handler(srv, sshConn, ch, ctx)
+		})
+	}
+	cancel()
+	closeQuietly(sshConn)
+	workers.closeAndWait()
+}
+
+type connectionChannelLimiter struct {
+	limit  int64
+	active atomic.Int64
+	global *resourceLimiter
+}
+
+func (l *connectionChannelLimiter) reserve() bool {
+	if l == nil {
+		return true
+	}
+	if l.limit > 0 && l.active.Add(1) > l.limit {
+		l.active.Add(-1)
+		return false
+	}
+	if l.global != nil && !l.global.reserve() {
+		if l.limit > 0 {
+			l.active.Add(-1)
+		}
+		return false
+	}
+	return true
+}
+
+func (l *connectionChannelLimiter) release() {
+	if l != nil && l.limit > 0 {
+		l.active.Add(-1)
+	}
+	if l != nil && l.global != nil {
+		l.global.release()
 	}
 }
 
-func (srv *Server) handleRequests(ctx Context, in <-chan *gossh.Request) {
+type resourceLimiter struct {
+	limit  int64
+	active *atomic.Int64
+}
+
+func (l *resourceLimiter) reserve() bool {
+	if l == nil || l.limit <= 0 || l.active == nil {
+		return true
+	}
+	if l.active.Add(1) <= l.limit {
+		return true
+	}
+	l.active.Add(-1)
+	return false
+}
+
+func (l *resourceLimiter) release() {
+	if l != nil && l.limit > 0 && l.active != nil {
+		l.active.Add(-1)
+	}
+}
+
+func configuredDuration(value *time.Duration, defaultValue time.Duration) time.Duration {
+	if value == nil {
+		return defaultValue
+	}
+	if *value <= 0 {
+		return 0
+	}
+	return *value
+}
+
+func earliestDeadline(deadlines ...time.Time) time.Time {
+	var result time.Time
+	for _, deadline := range deadlines {
+		if !deadline.IsZero() && (result.IsZero() || deadline.Before(result)) {
+			result = deadline
+		}
+	}
+	return result
+}
+
+func cancelAt(deadline time.Time, cancel context.CancelFunc) *time.Timer {
+	if deadline.IsZero() {
+		return nil
+	}
+	return time.AfterFunc(time.Until(deadline), cancel)
+}
+
+func configuredLimit(value *int, defaultValue int) int {
+	if value == nil {
+		return defaultValue
+	}
+	if *value <= 0 {
+		return 0
+	}
+	return *value
+}
+
+func (srv *Server) handleRequests(ctx Context, in <-chan *gossh.Request, handlers map[string]RequestHandler) {
 	for req := range in {
-		handler := srv.RequestHandlers[req.Type]
+		handler := handlers[req.Type]
 		if handler == nil {
-			handler = srv.RequestHandlers["default"]
+			handler = handlers["default"]
 		}
 		if handler == nil {
 			if err := req.Reply(false, nil); err != nil {
@@ -408,6 +947,7 @@ func (srv *Server) ListenAndServe() error {
 func (srv *Server) AddHostKey(key Signer) {
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
+	srv.generatedHostKey = nil
 
 	// these are later added via AddHostKey on ServerConfig, which performs the
 	// check for one of every algorithm.
@@ -428,13 +968,14 @@ func (srv *Server) AddHostKey(key Signer) {
 
 // SetOption runs a functional option against the server.
 func (srv *Server) SetOption(option Option) error {
-	// NOTE: there is a potential race here for any option that doesn't call an
-	// internal method. We can't actually lock here because if something calls
-	// (as an example) AddHostKey, it will deadlock.
-
-	//srv.mu.Lock()
-	//defer srv.mu.Unlock()
-
+	srv.configMu.Lock()
+	defer srv.configMu.Unlock()
+	srv.mu.RLock()
+	running := len(srv.listeners) > 0 || len(srv.activeConns) > 0
+	srv.mu.RUnlock()
+	if running {
+		return ErrServerRunning
+	}
 	return option(srv)
 }
 
@@ -464,18 +1005,25 @@ func (srv *Server) closeDoneChanLocked() {
 	}
 }
 
-func (srv *Server) closeListenersLocked() error {
-	var err error
+func (srv *Server) listenersLocked() []net.Listener {
+	listeners := make([]net.Listener, 0, len(srv.listeners))
 	for ln := range srv.listeners {
-		if cErr := ln.Close(); cErr != nil && err == nil {
+		listeners = append(listeners, ln)
+	}
+	return listeners
+}
+
+func closeListeners(listeners []net.Listener) error {
+	var err error
+	for _, ln := range listeners {
+		if cErr := ln.Close(); cErr != nil && !isClosedError(cErr) && err == nil {
 			err = cErr
 		}
-		delete(srv.listeners, ln)
 	}
 	return err
 }
 
-func (srv *Server) trackListener(ln net.Listener, add bool) {
+func (srv *Server) trackListener(ln net.Listener, add bool) bool {
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
 
@@ -483,17 +1031,18 @@ func (srv *Server) trackListener(ln net.Listener, add bool) {
 		srv.listeners = make(map[net.Listener]struct{})
 	}
 	if add {
-		// If the *Server is being reused after a previous
-		// Close or Shutdown, reset its doneChan:
-		if len(srv.listeners) == 0 && len(srv.conns) == 0 {
-			srv.doneChan = nil
+		if srv.isDoneLocked() && (len(srv.listeners) != 0 || len(srv.activeConns) != 0) {
+			return false
+		}
+		if len(srv.listeners) == 0 && len(srv.activeConns) == 0 {
+			srv.resetGenerationLocked()
 		}
 		srv.listeners[ln] = struct{}{}
-		srv.listenerWg.Add(1)
 	} else {
 		delete(srv.listeners, ln)
-		srv.listenerWg.Done()
+		srv.maybeCloseDrainedLocked()
 	}
+	return true
 }
 
 func (srv *Server) trackConn(c *gossh.ServerConn, add bool) {
@@ -505,15 +1054,197 @@ func (srv *Server) trackConn(c *gossh.ServerConn, add bool) {
 	}
 	if add {
 		srv.conns[c] = struct{}{}
-		srv.connWg.Add(1)
 	} else {
 		delete(srv.conns, c)
-		srv.connWg.Done()
 	}
 }
 
+func (srv *Server) trackActiveConn(conn net.Conn, allowReset bool) *activeConn {
+	srv.mu.Lock()
+	if srv.doneChan != nil {
+		select {
+		case <-srv.doneChan:
+			if allowReset && len(srv.listeners) == 0 && len(srv.activeConns) == 0 {
+				srv.resetGenerationLocked()
+			} else {
+				srv.mu.Unlock()
+				closeQuietly(conn)
+				return nil
+			}
+		default:
+		}
+	}
+	maxStartups := srv.effectiveMaxStartups()
+	dropRate := maxStartupsDropRate(srv.startups, maxStartups)
+	if dropRate >= 100 || dropRate > 0 && int(rand.UintN(100)) < dropRate {
+		srv.mu.Unlock()
+		closeQuietly(conn)
+		return nil
+	}
+	active := &activeConn{
+		conn:            conn,
+		acceptedAt:      time.Now(),
+		handshaking:     true,
+		startupReserved: maxStartups.Full > 0,
+	}
+	if srv.activeConns == nil {
+		srv.activeConns = make(map[*activeConn]struct{})
+	}
+	if srv.authenticatedConnections == nil || srv.globalChannels == nil {
+		srv.authenticatedConnections = &atomic.Int64{}
+		srv.globalChannels = &atomic.Int64{}
+	}
+	srv.activeConns[active] = struct{}{}
+	if active.startupReserved {
+		srv.startups++
+	}
+	srv.mu.Unlock()
+	return active
+}
+
+func (srv *Server) updateActiveConn(active *activeConn, conn net.Conn) bool {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if _, ok := srv.activeConns[active]; !ok || active.closed {
+		return false
+	}
+	active.conn = conn
+	return true
+}
+
+func (srv *Server) updateActiveCancel(active *activeConn, cancel context.CancelFunc) bool {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if _, ok := srv.activeConns[active]; !ok || active.closed {
+		return false
+	}
+	active.cancel = cancel
+	return true
+}
+
+func (srv *Server) untrackActiveConn(active *activeConn) {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if active.startupReserved {
+		srv.startups--
+		active.startupReserved = false
+	}
+	active.handshaking = false
+	delete(srv.activeConns, active)
+	srv.maybeCloseDrainedLocked()
+}
+
+func (srv *Server) waitForPreviousGeneration() {
+	for {
+		srv.mu.Lock()
+		if !srv.isDoneLocked() || len(srv.listeners) == 0 && len(srv.activeConns) == 0 {
+			srv.mu.Unlock()
+			return
+		}
+		drained := srv.getDrainedChanLocked()
+		srv.mu.Unlock()
+		<-drained
+	}
+}
+
+func (srv *Server) resetGenerationLocked() {
+	srv.doneChan = make(chan struct{})
+	srv.drainedChan = make(chan struct{})
+	srv.authenticatedConnections = &atomic.Int64{}
+	srv.globalChannels = &atomic.Int64{}
+}
+
+func (srv *Server) isDoneLocked() bool {
+	if srv.doneChan == nil {
+		return false
+	}
+	select {
+	case <-srv.doneChan:
+		return true
+	default:
+		return false
+	}
+}
+
+func (srv *Server) getDrainedChanLocked() chan struct{} {
+	if srv.drainedChan == nil {
+		srv.drainedChan = make(chan struct{})
+	}
+	srv.maybeCloseDrainedLocked()
+	return srv.drainedChan
+}
+
+func (srv *Server) maybeCloseDrainedLocked() {
+	if len(srv.listeners) != 0 || len(srv.activeConns) != 0 {
+		return
+	}
+	if srv.drainedChan == nil {
+		srv.drainedChan = make(chan struct{})
+	}
+	select {
+	case <-srv.drainedChan:
+	default:
+		close(srv.drainedChan)
+	}
+}
+
+func (srv *Server) releaseStartup(active *activeConn) {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	active.handshaking = false
+	if active.startupReserved {
+		srv.startups--
+		active.startupReserved = false
+	}
+}
+
+func (srv *Server) effectiveMaxStartups() MaxStartupsConfig {
+	if srv.MaxStartups == nil {
+		return MaxStartupsConfig{
+			Start: DefaultMaxStartupsStart,
+			Rate:  DefaultMaxStartupsRate,
+			Full:  DefaultMaxStartupsFull,
+		}
+	}
+	result := *srv.MaxStartups
+	if result.Full <= 0 {
+		return MaxStartupsConfig{}
+	}
+	if result.Start < 0 {
+		result.Start = 0
+	}
+	if result.Start > result.Full {
+		result.Start = result.Full
+	}
+	if result.Rate < 0 {
+		result.Rate = 0
+	} else if result.Rate > 100 {
+		result.Rate = 100
+	}
+	return result
+}
+
+func maxStartupsDropRate(current int, config MaxStartupsConfig) int {
+	if config.Full <= 0 {
+		return 0
+	}
+	if current >= config.Full {
+		return 100
+	}
+	if current < config.Start {
+		return 0
+	}
+	if config.Start >= config.Full {
+		return 0
+	}
+	return config.Rate + (100-config.Rate)*(current-config.Start)/(config.Full-config.Start)
+}
+
 func (srv *Server) logger() log.Logger {
-	if v := srv.Logger; v != nil {
+	srv.mu.RLock()
+	v := srv.Logger
+	srv.mu.RUnlock()
+	if v != nil {
 		return v
 	}
 	return defaultServerLoggerGetter()

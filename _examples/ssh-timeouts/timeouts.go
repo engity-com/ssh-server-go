@@ -34,8 +34,8 @@ func main() {
 	log.Printf("and timeout after %s of no activity\n", IdleTimeout)
 	server := &ssh.Server{
 		Addr:        ":2222",
-		MaxTimeout:  DeadlineTimeout,
-		IdleTimeout: IdleTimeout,
+		MaxTimeout:  &DeadlineTimeout,
+		IdleTimeout: &IdleTimeout,
 	}
 	log.Fatal(server.ListenAndServe())
 }

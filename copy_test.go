@@ -1,6 +1,7 @@
 package ssh
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -73,6 +74,49 @@ func TestFullDuplexCopyReturnsErrorFromSecondStream(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("copy did not finish")
 	}
+}
+
+func TestFullDuplexCopyCallsOnStartBeforeStreamCallbacks(t *testing.T) {
+	started := make(chan struct{})
+	ended := make(chan struct{})
+	left := &testReadWriteCloser{Reader: bytes.NewReader(nil), Writer: io.Discard}
+	right := &testReadWriteCloser{Reader: bytes.NewReader(nil), Writer: io.Discard}
+	err := FullDuplexCopy(context.Background(), left, right, &FullDuplexCopyOpts{
+		OnStart: func() { close(started) },
+		OnEnd:   func(int64, int64, time.Duration, error, *bool) { close(ended) },
+		OnStreamStart: func(bool) {
+			select {
+			case <-started:
+			default:
+				t.Error("stream callback ran before OnStart")
+			}
+		},
+	})
+	require.NoError(t, err)
+	select {
+	case <-ended:
+	case <-time.After(time.Second):
+		t.Fatal("observer callbacks did not complete")
+	}
+}
+
+func TestFullDuplexCopyDoesNotWaitForBlockingObserver(t *testing.T) {
+	blocked := make(chan struct{})
+	left := &testReadWriteCloser{Reader: bytes.NewReader(nil), Writer: io.Discard}
+	right := &testReadWriteCloser{Reader: bytes.NewReader(nil), Writer: io.Discard}
+	result := make(chan error, 1)
+	go func() {
+		result <- FullDuplexCopy(context.Background(), left, right, &FullDuplexCopyOpts{
+			OnStreamStart: func(bool) { <-blocked },
+		})
+	}()
+	select {
+	case err := <-result:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("blocking observer stalled FullDuplexCopy")
+	}
+	close(blocked)
 }
 
 type testReadWriteCloser struct {

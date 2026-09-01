@@ -3,6 +3,7 @@ package ssh
 import (
 	"crypto/subtle"
 	"net"
+	"sync"
 
 	gossh "golang.org/x/crypto/ssh"
 )
@@ -28,6 +29,14 @@ const (
 
 // DefaultHandler is the default Handler used by Serve.
 var DefaultHandler Handler
+
+var defaultHandlerMu sync.RWMutex
+
+func getDefaultHandler() Handler {
+	defaultHandlerMu.RLock()
+	defer defaultHandlerMu.RUnlock()
+	return DefaultHandler
+}
 
 // Option is a functional option handler for Server.
 type Option func(*Server) error
@@ -56,6 +65,8 @@ type SessionRequestCallback func(sess Session, requestType string) bool
 // ConnCallback is a hook for new connections before handling.
 // It allows wrapping for timeouts and limiting by returning
 // the net.Conn that will be used as the underlying connection.
+// Implementations must return promptly and honor Context cancellation; network
+// deadlines cannot forcibly stop callback code that blocks without doing I/O.
 type ConnCallback func(ctx Context, conn net.Conn) net.Conn
 
 // LocalPortForwardingCallback is a hook for allowing port forwarding
@@ -64,8 +75,10 @@ type LocalPortForwardingCallback func(ctx Context, destinationHost string, desti
 // ReversePortForwardingCallback is a hook for allowing reverse port forwarding
 type ReversePortForwardingCallback func(ctx Context, bindHost string, bindPort uint32) bool
 
-// ServerConfigCallback is a hook for creating custom default server configs
-type ServerConfigCallback func(ctx Context) *gossh.ServerConfig
+// ServerConfigCallback customizes a fresh per-connection server config. Public
+// key multi-factor authentication must return PartialSuccessError from
+// VerifiedPublicKeyCallback, after key ownership has been proven.
+type ServerConfigCallback func(ctx Context, config *gossh.ServerConfig)
 
 // ConnectionFailedCallback is a hook for reporting failed connections
 // Please note: the net.Conn is likely to be closed at this point
@@ -113,6 +126,8 @@ func ListenAndServe(addr string, handler Handler, options ...Option) error {
 
 // Handle registers the handler as the DefaultHandler.
 func Handle(handler Handler) {
+	defaultHandlerMu.Lock()
+	defer defaultHandlerMu.Unlock()
 	DefaultHandler = handler
 }
 
