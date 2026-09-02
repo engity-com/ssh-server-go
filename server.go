@@ -102,6 +102,11 @@ type Server struct {
 	ConnectionFailedCallback ConnectionFailedCallback // callback to report connection failures
 	DisconnectCallback       DisconnectCallback       // callback after an established SSH connection ends
 
+	// ProxyProtocol enables PROXY protocol processing when non-nil. Connection
+	// wrapping occurs before ConnCallback and the SSH handshake. Do not pass
+	// connections already wrapped by go-proxyproto when this is configured.
+	ProxyProtocol *ProxyProtocolConfig
+
 	// Timeout fields use their Default* value when nil. A configured duration
 	// less than or equal to zero disables that timeout.
 	HandshakeTimeout *time.Duration // timeout until successful authentication, default 2 minutes
@@ -182,6 +187,7 @@ type connectionSettings struct {
 	authenticatedConnections      *atomic.Int64
 	globalChannels                *atomic.Int64
 	requireClientAuth             bool
+	proxyProtocol                 *ProxyProtocolConfig
 }
 
 func (srv *Server) connectionSettings() *connectionSettings {
@@ -202,6 +208,11 @@ func (srv *Server) connectionSettings() *connectionSettings {
 	handler := srv.Handler
 	if handler == nil {
 		handler = getDefaultHandler()
+	}
+	proxyProtocol := srv.ProxyProtocol
+	if proxyProtocol != nil {
+		config := *proxyProtocol
+		proxyProtocol = &config
 	}
 	return &connectionSettings{
 		logger:                        srv.Logger,
@@ -230,6 +241,7 @@ func (srv *Server) connectionSettings() *connectionSettings {
 		authenticatedConnections:      srv.authenticatedConnections,
 		globalChannels:                srv.globalChannels,
 		requireClientAuth:             srv.RequireClientAuth,
+		proxyProtocol:                 proxyProtocol,
 	}
 }
 
@@ -872,9 +884,27 @@ func (srv *Server) handleConn(newConn net.Conn, active *activeConn, settings ...
 	if maxTimer != nil {
 		defer maxTimer.Stop()
 	}
+	if v := connectionSettings.proxyProtocol; v != nil {
+		proxyConn, err := wrapProxyProtocolConn(newConn, *v)
+		if err != nil {
+			srv.releaseStartup(active)
+			closeQuietly(newConn)
+			srv.untrackActiveConn(active)
+			tracked = false
+			if connectionSettings.connectionFailedCallback != nil {
+				connectionSettings.connectionFailedCallback(newConn, err)
+			}
+			return
+		}
+		newConn = proxyConn
+		if !srv.updateActiveConn(active, proxyConn) {
+			closeQuietly(proxyConn)
+			return
+		}
+	}
 	_ = newConn.SetDeadline(earliestDeadline(handshakeDeadline, maxDeadline))
-	if connectionSettings.connCallback != nil {
-		cbConn := connectionSettings.connCallback(ctx, newConn)
+	if v := connectionSettings.connCallback; v != nil {
+		cbConn := v(ctx, newConn)
 		if cbConn == nil {
 			closeQuietly(newConn)
 			return

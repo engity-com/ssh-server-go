@@ -1,6 +1,7 @@
 package ssh
 
 import (
+	"errors"
 	"os"
 
 	gossh "golang.org/x/crypto/ssh"
@@ -79,6 +80,24 @@ func NoPty() Option {
 func WrapConn(fn ConnCallback) Option {
 	return func(srv *Server) error {
 		srv.ConnCallback = fn
+		return nil
+	}
+}
+
+// EnableProxyProtocol returns a functional option that enables PROXY protocol
+// processing. With no configuration, every connection must supply a PROXY
+// header and the header is trusted from any peer. At most one configuration
+// may be supplied.
+func EnableProxyProtocol(config ...ProxyProtocolConfig) Option {
+	return func(srv *Server) error {
+		if len(config) > 1 {
+			return errors.New("ssh: enable proxy protocol accepts at most one configuration")
+		}
+		configured := ProxyProtocolConfig{}
+		if len(config) == 1 {
+			configured = config[0]
+		}
+		srv.ProxyProtocol = &configured
 		return nil
 	}
 }
