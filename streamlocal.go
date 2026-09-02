@@ -67,6 +67,8 @@ func DirectStreamLocalHandler(srv *Server, sshConn *gossh.ServerConn, newChan go
 		_ = newChan.Reject(gossh.ConnectionFailed, "connection failed")
 		return
 	}
+	unregisterConn := registerConnectionResource(ctx, func() { closeQuietly(conn) })
+	defer unregisterConn()
 
 	channel, reqs, err := newChan.Accept()
 	if err != nil {
@@ -156,6 +158,7 @@ func (h *ForwardedUnixHandler) HandleSSHRequest(ctx Context, srv *Server, req *g
 		}
 
 		f := newForward(listener, forwardLimiter.release)
+		unregisterForward := registerConnectionResource(ctx, f.close)
 		h.Lock()
 		if h.forwards == nil {
 			h.forwards = make(map[forwardKey]*forward)
@@ -170,6 +173,7 @@ func (h *ForwardedUnixHandler) HandleSSHRequest(ctx Context, srv *Server, req *g
 		reply, _ := ctx.Value(contextKeyRequestReply).(*requestReply)
 
 		started := startConnectionWorker(ctx, func() {
+			defer unregisterForward()
 			stopCloseOnCancel := context.AfterFunc(ctx, f.close)
 			defer stopCloseOnCancel()
 			defer func() {
@@ -190,6 +194,7 @@ func (h *ForwardedUnixHandler) HandleSSHRequest(ctx Context, srv *Server, req *g
 			h.forwardConnections(ctx, conn, payload.SocketPath, f)
 		})
 		if !started {
+			unregisterForward()
 			h.removeForward(key, f)
 			f.close()
 			return false, nil
@@ -220,8 +225,13 @@ func (h *ForwardedUnixHandler) HandleSSHRequest(ctx Context, srv *Server, req *g
 func (h *ForwardedUnixHandler) forwardConnections(ctx Context, conn *gossh.ServerConn, socketPath string, f *forward) {
 	limiter, _ := ctx.Value(contextKeyChannelLimiter).(*connectionChannelLimiter)
 	for {
+		finishAcquisition, ok := beginConnectionResourceAcquisition(ctx)
+		if !ok {
+			return
+		}
 		accepted, err := f.listener.Accept()
 		if err != nil {
+			finishAcquisition(nil)
 			closeQuietly(accepted)
 			if !isClosedError(err) {
 				h.loggerOfConnection(conn).WithError(err).
@@ -230,18 +240,22 @@ func (h *ForwardedUnixHandler) forwardConnections(ctx Context, conn *gossh.Serve
 			}
 			return
 		}
+		unregisterConn := finishAcquisition(func() { closeQuietly(accepted) })
 		if !limiter.reserve() {
+			unregisterConn()
 			closeQuietly(accepted)
 			h.loggerOfConnection(conn).With("streamlocal.path", socketPath).
 				Warn("'streamlocal-forward@openssh.com': too many open SSH channels; rejecting connection")
 			continue
 		}
 		if !f.beginOpen() {
+			unregisterConn()
 			limiter.release()
 			closeQuietly(accepted)
 			return
 		}
 		if !startConnectionWorker(ctx, func() {
+			defer unregisterConn()
 			defer limiter.release()
 			defer closeQuietly(accepted)
 			payload := gossh.Marshal(&remoteUnixForwardChannelData{SocketPath: socketPath})
@@ -266,6 +280,7 @@ func (h *ForwardedUnixHandler) forwardConnections(ctx Context, conn *gossh.Serve
 					Warn("'streamlocal-forward@openssh.com': failed to forward connection")
 			}
 		}) {
+			unregisterConn()
 			f.endOpen()
 			limiter.release()
 			closeQuietly(accepted)

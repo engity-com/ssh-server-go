@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log"
@@ -66,5 +67,5 @@ func main() {
 	log.Printf("allowing direct Unix forwarding to %q", directSocketPath)
 	log.Printf("allowing reverse Unix forwarding on %q", reverseSocketPath)
 	log.Printf("starting SSH server on %s", listenAddress)
-	log.Fatal(server.ListenAndServe())
+	log.Fatal(server.ListenAndServe(context.Background()))
 }

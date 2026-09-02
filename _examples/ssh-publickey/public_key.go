@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -22,5 +23,5 @@ func main() {
 
 	log.Println("DEVELOPMENT ONLY: every public key is accepted and the host key is ephemeral")
 	log.Println("starting ssh server on 127.0.0.1:2222...")
-	log.Fatal(ssh.ListenAndServe("127.0.0.1:2222", nil, publicKeyOption))
+	log.Fatal(ssh.ListenAndServe(context.Background(), "127.0.0.1:2222", nil, publicKeyOption))
 }

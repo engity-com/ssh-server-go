@@ -6,6 +6,7 @@ This Go package wraps the [crypto/ssh package](https://pkg.go.dev/golang.org/x/c
  package main
 
  import (
+     "context"
      "io"
      "log"
 
@@ -17,7 +18,7 @@ This Go package wraps the [crypto/ssh package](https://pkg.go.dev/golang.org/x/c
          io.WriteString(s, "Hello world\n")
      })
 
-     log.Fatal(ssh.ListenAndServe("127.0.0.1:2222", nil))
+     log.Fatal(ssh.ListenAndServe(context.Background(), "127.0.0.1:2222", nil))
  }
 
 ```

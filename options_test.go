@@ -1,11 +1,14 @@
 package ssh
 
 import (
+	"context"
 	"net"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/stretchr/testify/require"
 	gossh "golang.org/x/crypto/ssh"
 )
 
@@ -56,11 +59,8 @@ func TestPasswordAuthBadPass(t *testing.T) {
 	})); err != nil {
 		t.Fatal(err)
 	}
-	go func() {
-		if err := srv.serveOnce(l); err != nil {
-			t.Error(err)
-		}
-	}()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- srv.serveOnce(l) }()
 	_, err := gossh.Dial("tcp", l.Addr().String(), &gossh.ClientConfig{
 		User: "testuser",
 		Auth: []gossh.AuthMethod{
@@ -72,6 +72,9 @@ func TestPasswordAuthBadPass(t *testing.T) {
 		if !strings.Contains(err.Error(), "unable to authenticate") {
 			t.Fatal(err)
 		}
+	}
+	if err := <-serveDone; err == nil {
+		t.Fatal("HandleConn() error = nil; want authentication failure")
 	}
 }
 
@@ -112,4 +115,23 @@ func TestConnWrapping(t *testing.T) {
 	if atomic.LoadInt32(&(wrapped.written)) == 0 {
 		t.Fatal("wrapped connection not written to")
 	}
+}
+
+func TestNewGracefulShutdownTimeoutHandler(t *testing.T) {
+	timeout := 3 * time.Second
+	handler := NewGracefulShutdownTimeoutHandler(timeout)
+	require.Equal(t, timeout, handler(context.Background()))
+}
+
+func TestWithGracefulShutdownHandler(t *testing.T) {
+	handler := NewGracefulShutdownTimeoutHandler(time.Second)
+	srv := &Server{}
+	require.NoError(t, srv.SetOption(WithGracefulShutdownHandler(handler)))
+	require.Equal(t, time.Second, srv.GracefulShutdownHandler(context.Background()))
+}
+
+func TestWithGracefulShutdownTimeout(t *testing.T) {
+	srv := &Server{}
+	require.NoError(t, srv.SetOption(WithGracefulShutdownTimeout(2*time.Second)))
+	require.Equal(t, 2*time.Second, srv.GracefulShutdownHandler(context.Background()))
 }

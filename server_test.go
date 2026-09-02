@@ -1,7 +1,6 @@
 package ssh
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -15,6 +14,22 @@ import (
 	"github.com/stretchr/testify/require"
 	gossh "golang.org/x/crypto/ssh"
 )
+
+func activeConnectionCount(srv *Server) int {
+	srv.mu.RLock()
+	scopes := make([]*serveScope, 0, len(srv.scopes))
+	for scope := range srv.scopes {
+		scopes = append(scopes, scope)
+	}
+	srv.mu.RUnlock()
+	result := 0
+	for _, scope := range scopes {
+		scope.mu.Lock()
+		result += len(scope.connections)
+		scope.mu.Unlock()
+	}
+	return result
+}
 
 func TestAddHostKey(t *testing.T) {
 	s := Server{}
@@ -64,7 +79,7 @@ func TestHandleConnInitializesHostSigner(t *testing.T) {
 			t.Error(err)
 			return
 		}
-		srv.HandleConn(serverConn)
+		_ = srv.HandleConn(context.Background(), serverConn)
 	}()
 
 	clientConn, err := net.Dial("tcp", listener.Addr().String())
@@ -147,97 +162,37 @@ func TestDisconnectCallbackWaitsForConnectionWorkers(t *testing.T) {
 	require.Never(t, func() bool { return calls.Load() > 1 }, 20*time.Millisecond, time.Millisecond)
 }
 
-func TestDisconnectCallbackRunsAfterServerClose(t *testing.T) {
-	disconnected := make(chan error, 1)
-	var calls atomic.Int32
-	srv := &Server{DisconnectCallback: func(ctx Context, _ net.Conn) {
-		calls.Add(1)
-		disconnected <- ctx.Err()
-	}}
-	session, client, cleanup := newTestSession(t, srv, nil)
-	defer cleanup()
-	defer closeQuietly(session)
-	defer closeQuietly(client)
-
-	require.NoError(t, srv.Close())
-	select {
-	case err := <-disconnected:
-		require.ErrorIs(t, err, context.Canceled)
-	case <-time.After(time.Second):
-		t.Fatal("disconnect callback was not called after server close")
-	}
-	require.NoError(t, srv.Close())
-	require.Never(t, func() bool { return calls.Load() > 1 }, 20*time.Millisecond, time.Millisecond)
-}
-
-func TestDisconnectCallbackCanShutdownServer(t *testing.T) {
-	shutdownResult := make(chan error, 1)
-	var srv *Server
-	srv = &Server{DisconnectCallback: func(Context, net.Conn) {
-		shutdownResult <- srv.Shutdown(context.Background())
-	}}
-	l := newLocalListener()
-	serveDone := make(chan error, 1)
-	go func() { serveDone <- srv.Serve(l) }()
-	t.Cleanup(func() {
-		_ = srv.Close()
-		closeQuietly(l)
-	})
-	client, err := gossh.Dial("tcp", l.Addr().String(), &gossh.ClientConfig{
-		User:            "user",
-		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
-	})
-	require.NoError(t, err)
-	defer closeQuietly(client)
-	require.NoError(t, client.Close())
-
-	select {
-	case err := <-shutdownResult:
-		require.NoError(t, err)
-	case <-time.After(time.Second):
-		t.Fatal("disconnect callback deadlocked while shutting down the server")
-	}
-	require.ErrorIs(t, <-serveDone, ErrServerClosed)
-}
-
 func TestHandleConnReportsRequiredHostSigner(t *testing.T) {
-	callbackResult := make(chan error, 1)
-	srv := &Server{RequireHostSigners: true}
-	srv.ConnectionFailedCallback = func(_ net.Conn, err error) {
-		callbackResult <- errors.Join(err, srv.SetOption(NoPty()))
-	}
-	serverConn, clientConn := net.Pipe()
-	defer closeQuietly(clientConn)
-	srv.HandleConn(serverConn)
-
-	require.ErrorIs(t, <-callbackResult, ErrServerHostSignerRequired)
-	_ = clientConn.SetReadDeadline(time.Now().Add(time.Second))
-	_, err := clientConn.Read(make([]byte, 1))
-	require.Error(t, err)
-	srv.mu.RLock()
-	require.Empty(t, srv.activeConns)
-	require.Zero(t, srv.startups)
-	drained := srv.drainedChan
-	srv.mu.RUnlock()
-	select {
-	case <-drained:
-	default:
-		t.Fatal("host signer failure did not drain the generation")
-	}
-}
-
-func TestRequireClientAuthReportsMissingAuthentication(t *testing.T) {
-	result := make(chan error, 1)
+	var callbackCalls atomic.Int32
 	srv := &Server{
-		RequireClientAuth: true,
-		ConnectionFailedCallback: func(_ net.Conn, err error) {
-			result <- err
+		RequireHostSigners: true,
+		ConnectionFailedCallback: func(net.Conn, error) {
+			callbackCalls.Add(1)
 		},
 	}
 	serverConn, clientConn := net.Pipe()
 	defer closeQuietly(clientConn)
-	srv.HandleConn(serverConn)
-	require.ErrorIs(t, <-result, ErrServerClientAuthRequired)
+	err := srv.HandleConn(context.Background(), serverConn)
+
+	require.ErrorIs(t, err, ErrServerHostSignerRequired)
+	_ = clientConn.SetReadDeadline(time.Now().Add(time.Second))
+	_, err = clientConn.Read(make([]byte, 1))
+	require.Error(t, err)
+	srv.mu.RLock()
+	require.Empty(t, srv.scopes)
+	require.Zero(t, srv.startups)
+	srv.mu.RUnlock()
+	require.Zero(t, callbackCalls.Load())
+}
+
+func TestRequireClientAuthReportsMissingAuthentication(t *testing.T) {
+	srv := &Server{
+		RequireClientAuth: true,
+	}
+	serverConn, clientConn := net.Pipe()
+	defer closeQuietly(clientConn)
+	err := srv.HandleConn(context.Background(), serverConn)
+	require.ErrorIs(t, err, ErrServerClientAuthRequired)
 }
 
 func TestRequireClientAuthRejectsExplicitAnonymousAuthentication(t *testing.T) {
@@ -363,40 +318,6 @@ func TestConflictingPartialSuccessCallbacksAreRejected(t *testing.T) {
 	require.ErrorIs(t, err, ErrServerAuthCallbackConflict)
 }
 
-func TestHandleConnNaturalReuseStartsFreshDrainLifecycle(t *testing.T) {
-	secondEntered := make(chan struct{})
-	releaseSecond := make(chan struct{})
-	var calls atomic.Int32
-	srv := &Server{ConnCallback: func(Context, net.Conn) net.Conn {
-		if calls.Add(1) == 2 {
-			close(secondEntered)
-			<-releaseSecond
-		}
-		return nil
-	}}
-	first, firstPeer := net.Pipe()
-	defer closeQuietly(firstPeer)
-	srv.HandleConn(first)
-
-	second, secondPeer := net.Pipe()
-	defer closeQuietly(secondPeer)
-	secondDone := make(chan struct{})
-	go func() {
-		defer close(secondDone)
-		srv.HandleConn(second)
-	}()
-	<-secondEntered
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	require.ErrorIs(t, srv.Shutdown(ctx), context.DeadlineExceeded)
-	close(releaseSecond)
-	select {
-	case <-secondDone:
-	case <-time.After(time.Second):
-		t.Fatal("reused direct connection did not drain")
-	}
-}
-
 func TestConnectionSettingsSnapshot(t *testing.T) {
 	timeout := time.Second
 	oldHandlerCalled := false
@@ -431,7 +352,7 @@ func TestConnectionSettingsSnapshot(t *testing.T) {
 }
 
 func TestSetOptionRejectsRunningServer(t *testing.T) {
-	srv := &Server{activeConns: map[*activeConn]struct{}{{}: {}}}
+	srv := &Server{scopes: map[*serveScope]struct{}{{}: {}}}
 	called := false
 	option := func(*Server) error {
 		called = true
@@ -440,7 +361,7 @@ func TestSetOptionRejectsRunningServer(t *testing.T) {
 
 	require.ErrorIs(t, srv.SetOption(option), ErrServerRunning)
 	require.False(t, called)
-	srv.activeConns = nil
+	srv.scopes = nil
 	require.NoError(t, srv.SetOption(option))
 	require.True(t, called)
 }
@@ -463,7 +384,7 @@ func TestHandleConnIsRejectedDuringOptionUpdate(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		srv.HandleConn(serverConn)
+		_ = srv.HandleConn(context.Background(), serverConn)
 	}()
 	select {
 	case <-done:
@@ -953,105 +874,6 @@ func algorithmNames[T interface{ String() string }](algorithms []T) []string {
 	return result
 }
 
-func TestServerShutdown(t *testing.T) {
-	l := newLocalListener()
-	testBytes := []byte("Hello world\n")
-	s := &Server{
-		Handler: func(s Session) {
-			if _, err := s.Write(testBytes); err != nil {
-				t.Error(err)
-			}
-			time.Sleep(50 * time.Millisecond)
-		},
-	}
-	go func() {
-		err := s.Serve(l)
-		if err != nil && !errors.Is(err, ErrServerClosed) {
-			t.Error(err)
-		}
-	}()
-	sessDone := make(chan struct{})
-	sess, _, cleanup := newClientSession(t, l.Addr().String(), nil)
-	go func() {
-		defer cleanup()
-		defer close(sessDone)
-		var stdout bytes.Buffer
-		sess.Stdout = &stdout
-		if err := sess.Run(""); err != nil {
-			t.Error(err)
-		}
-		if !bytes.Equal(stdout.Bytes(), testBytes) {
-			t.Errorf("expected = %s; got %s", testBytes, stdout.Bytes())
-		}
-	}()
-
-	srvDone := make(chan struct{})
-	go func() {
-		defer close(srvDone)
-		err := s.Shutdown(context.Background())
-		if err != nil {
-			t.Error(err)
-		}
-	}()
-
-	timeout := time.After(2 * time.Second)
-	select {
-	case <-timeout:
-		t.Fatal("timeout")
-		return
-	case <-srvDone:
-		// TODO: add timeout for sessDone
-		<-sessDone
-		return
-	}
-}
-
-func TestServerClose(t *testing.T) {
-	l := newLocalListener()
-	s := &Server{
-		Handler: func(s Session) {
-			time.Sleep(5 * time.Second)
-		},
-	}
-	go func() {
-		err := s.Serve(l)
-		if err != nil && !errors.Is(err, ErrServerClosed) {
-			t.Error(err)
-		}
-	}()
-
-	clientDoneChan := make(chan struct{})
-	closeDoneChan := make(chan struct{})
-
-	sess, _, cleanup := newClientSession(t, l.Addr().String(), nil)
-	go func() {
-		defer cleanup()
-		defer close(clientDoneChan)
-		<-closeDoneChan
-		if err := sess.Run(""); err != nil && err != io.EOF {
-			t.Error(err)
-		}
-	}()
-
-	go func() {
-		err := s.Close()
-		if err != nil {
-			t.Error(err)
-		}
-		close(closeDoneChan)
-	}()
-
-	timeout := time.After(100 * time.Millisecond)
-	select {
-	case <-timeout:
-		t.Error("timeout")
-		return
-	case <-s.getDoneChan():
-		<-clientDoneChan
-		return
-	}
-}
-
 func TestServerHandshakeTimeout(t *testing.T) {
 	l := newLocalListener()
 	handshakeTimeout := time.Millisecond
@@ -1059,11 +881,13 @@ func TestServerHandshakeTimeout(t *testing.T) {
 	s := &Server{
 		HandshakeTimeout: &handshakeTimeout,
 	}
-	go func() {
-		if err := s.Serve(l); err != nil {
-			t.Error(err)
-		}
-	}()
+	ctx, cancel := context.WithCancel(context.Background())
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- s.Serve(ctx, l) }()
+	t.Cleanup(func() {
+		cancel()
+		require.ErrorIs(t, <-serveDone, context.Canceled)
+	})
 
 	conn, err := net.Dial("tcp", l.Addr().String())
 	if err != nil {
@@ -1117,7 +941,7 @@ func TestTimeoutCancelsBlockingConnCallback(t *testing.T) {
 			done := make(chan struct{})
 			go func() {
 				defer close(done)
-				srv.HandleConn(serverConn)
+				_ = srv.HandleConn(context.Background(), serverConn)
 			}()
 			select {
 			case <-done:
@@ -1128,7 +952,7 @@ func TestTimeoutCancelsBlockingConnCallback(t *testing.T) {
 	}
 }
 
-func TestCloseCancelsConnCallbackContext(t *testing.T) {
+func TestHandleConnContextCancelsConnCallback(t *testing.T) {
 	disabled := time.Duration(0)
 	callbackEntered := make(chan struct{})
 	srv := &Server{
@@ -1141,17 +965,18 @@ func TestCloseCancelsConnCallbackContext(t *testing.T) {
 	}
 	serverConn, clientConn := net.Pipe()
 	defer closeQuietly(clientConn)
-	done := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
 	go func() {
-		defer close(done)
-		srv.HandleConn(serverConn)
+		done <- srv.HandleConn(ctx, serverConn)
 	}()
 	<-callbackEntered
-	require.NoError(t, srv.Close())
+	cancel()
 	select {
-	case <-done:
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
 	case <-time.After(time.Second):
-		t.Fatal("Close did not cancel ConnCallback context")
+		t.Fatal("context cancellation did not cancel ConnCallback")
 	}
 }
 
@@ -1211,8 +1036,9 @@ func TestConnectionChannelLimiterUsesGlobalLimit(t *testing.T) {
 func TestMaxStartupsRejectsConnectionsAtFullLimit(t *testing.T) {
 	l := newLocalListener()
 	s := &Server{MaxStartups: &MaxStartupsConfig{Start: 1, Rate: 0, Full: 1}}
+	ctx, cancel := context.WithCancel(context.Background())
 	serveDone := make(chan error, 1)
-	go func() { serveDone <- s.Serve(l) }()
+	go func() { serveDone <- s.Serve(ctx, l) }()
 
 	first, err := net.Dial("tcp", l.Addr().String())
 	require.NoError(t, err)
@@ -1233,8 +1059,8 @@ func TestMaxStartupsRejectsConnectionsAtFullLimit(t *testing.T) {
 		require.False(t, netErr.Timeout(), "connection was not rejected at the startup limit")
 	}
 
-	require.NoError(t, s.Close())
-	require.ErrorIs(t, <-serveDone, ErrServerClosed)
+	cancel()
+	require.ErrorIs(t, <-serveDone, context.Canceled)
 }
 
 func TestDisconnectCallbackRunsForAuthenticatedConnectionLimitRejection(t *testing.T) {
@@ -1255,17 +1081,20 @@ func TestDisconnectCallbackRunsForAuthenticatedConnectionLimitRejection(t *testi
 		},
 	}
 	l := newLocalListener()
+	ctx, cancel := context.WithCancel(context.Background())
 	serveDone := make(chan error, 1)
-	go func() { serveDone <- s.Serve(l) }()
+	go func() { serveDone <- s.Serve(ctx, l) }()
 	var clients []*gossh.Client
 	t.Cleanup(func() {
 		for _, client := range clients {
 			closeQuietly(client)
 		}
-		_ = s.Close()
-		closeQuietly(l)
+		cancel()
 		select {
-		case <-serveDone:
+		case err := <-serveDone:
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("Serve() error = %v; want %v", err, context.Canceled)
+			}
 		case <-time.After(time.Second):
 			t.Error("server did not stop during test cleanup")
 		}
@@ -1320,8 +1149,9 @@ func TestFailedHandshakeReleasesStartupBeforeCallback(t *testing.T) {
 		},
 		DisconnectCallback: func(Context, net.Conn) { disconnectCalls.Add(1) },
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	serveDone := make(chan error, 1)
-	go func() { serveDone <- s.Serve(l) }()
+	go func() { serveDone <- s.Serve(ctx, l) }()
 
 	first, err := net.Dial("tcp", l.Addr().String())
 	require.NoError(t, err)
@@ -1345,26 +1175,25 @@ func TestFailedHandshakeReleasesStartupBeforeCallback(t *testing.T) {
 	require.Equal(t, "SSH-", string(version))
 
 	close(releaseCallback)
-	require.NoError(t, s.Close())
-	require.ErrorIs(t, <-serveDone, ErrServerClosed)
+	cancel()
+	require.ErrorIs(t, <-serveDone, context.Canceled)
 }
 
-func TestServerCloseClosesConnectionDuringHandshake(t *testing.T) {
+func TestServeContextClosesConnectionDuringHandshake(t *testing.T) {
 	l := newLocalListener()
 	s := &Server{}
+	ctx, cancel := context.WithCancel(context.Background())
 	serveDone := make(chan error, 1)
-	go func() { serveDone <- s.Serve(l) }()
+	go func() { serveDone <- s.Serve(ctx, l) }()
 
 	conn, err := net.Dial("tcp", l.Addr().String())
 	require.NoError(t, err)
 	defer closeQuietly(conn)
 
 	require.Eventually(t, func() bool {
-		s.mu.RLock()
-		defer s.mu.RUnlock()
-		return len(s.activeConns) == 1
+		return activeConnectionCount(s) == 1
 	}, time.Second, time.Millisecond)
-	require.NoError(t, s.Close())
+	cancel()
 	require.NoError(t, conn.SetReadDeadline(time.Now().Add(time.Second)))
 	_, err = io.ReadAll(conn)
 	if netErr, ok := errors.AsType[net.Error](err); ok {
@@ -1372,10 +1201,10 @@ func TestServerCloseClosesConnectionDuringHandshake(t *testing.T) {
 	} else {
 		require.NoError(t, err)
 	}
-	require.ErrorIs(t, <-serveDone, ErrServerClosed)
+	require.ErrorIs(t, <-serveDone, context.Canceled)
 }
 
-func TestServerCloseRejectsConnCallbackReplacement(t *testing.T) {
+func TestHandleConnContextRejectsConnCallbackReplacement(t *testing.T) {
 	original, originalPeer := net.Pipe()
 	replacement, replacementPeer := net.Pipe()
 	defer closeQuietly(originalPeer)
@@ -1389,110 +1218,22 @@ func TestServerCloseRejectsConnCallbackReplacement(t *testing.T) {
 			return replacement
 		},
 	}
-	handleDone := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	handleDone := make(chan error, 1)
 	go func() {
-		defer close(handleDone)
-		s.HandleConn(original)
+		handleDone <- s.HandleConn(ctx, original)
 	}()
 	<-callbackEntered
-	require.NoError(t, s.Close())
+	cancel()
 	close(releaseCallback)
 	select {
-	case <-handleDone:
+	case err := <-handleDone:
+		require.ErrorIs(t, err, context.Canceled)
 	case <-time.After(time.Second):
-		t.Fatal("connection callback did not stop after server close")
+		t.Fatal("connection callback did not stop after context cancellation")
 	}
 	_, err := replacementPeer.Read(make([]byte, 1))
 	require.Error(t, err)
-}
-
-func TestServerReuseRejectsConnectionsUntilPreviousGenerationDrains(t *testing.T) {
-	firstEntered := make(chan struct{})
-	thirdEntered := make(chan struct{})
-	releaseFirst := make(chan struct{})
-	setOptionResult := make(chan error, 1)
-	var calls atomic.Int32
-	var srv *Server
-	srv = &Server{ConnCallback: func(Context, net.Conn) net.Conn {
-		if calls.Add(1) == 1 {
-			close(firstEntered)
-			<-releaseFirst
-			setOptionResult <- srv.SetOption(NoPty())
-		} else {
-			close(thirdEntered)
-		}
-		return nil
-	}}
-	first, firstPeer := net.Pipe()
-	defer closeQuietly(firstPeer)
-	go srv.HandleConn(first)
-	<-firstEntered
-	require.NoError(t, srv.Close())
-
-	second, secondPeer := net.Pipe()
-	defer closeQuietly(secondPeer)
-	secondDone := make(chan struct{})
-	go func() {
-		defer close(secondDone)
-		srv.HandleConn(second)
-	}()
-	select {
-	case <-secondDone:
-	case <-time.After(time.Second):
-		t.Fatal("connection was not rejected while the previous generation drained")
-	}
-	_ = secondPeer.SetReadDeadline(time.Now().Add(time.Second))
-	_, err := secondPeer.Read(make([]byte, 1))
-	require.Error(t, err)
-	close(releaseFirst)
-	require.ErrorIs(t, <-setOptionResult, ErrServerRunning)
-	require.Eventually(t, func() bool {
-		srv.mu.RLock()
-		defer srv.mu.RUnlock()
-		return len(srv.activeConns) == 0
-	}, time.Second, time.Millisecond)
-
-	third, thirdPeer := net.Pipe()
-	defer closeQuietly(thirdPeer)
-	thirdDone := make(chan struct{})
-	go func() {
-		defer close(thirdDone)
-		srv.HandleConn(third)
-	}()
-	select {
-	case <-thirdEntered:
-	case <-time.After(time.Second):
-		t.Fatal("new generation did not start after the previous one drained")
-	}
-	<-thirdDone
-}
-
-func TestHandleConnIsTrackedBeforeConfiguration(t *testing.T) {
-	srv := &Server{ConnCallback: func(Context, net.Conn) net.Conn { return nil }}
-	serverConn, clientConn := net.Pipe()
-	defer closeQuietly(clientConn)
-	srv.configMu.Lock()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		srv.HandleConn(serverConn)
-	}()
-	require.Eventually(t, func() bool {
-		srv.mu.RLock()
-		defer srv.mu.RUnlock()
-		return len(srv.activeConns) == 1
-	}, time.Second, time.Millisecond)
-	err := srv.Close()
-	srv.configMu.Unlock()
-	require.NoError(t, err)
-	_ = clientConn.SetReadDeadline(time.Now().Add(time.Second))
-	_, err = clientConn.Read(make([]byte, 1))
-	require.Error(t, err)
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("HandleConn did not return after Close")
-	}
 }
 
 func TestServerConnDeadlineAccessIsSynchronized(t *testing.T) {

@@ -16,12 +16,13 @@ type contextKey struct {
 }
 
 var (
-	contextKeyChannelLimiter    = &contextKey{"channel-limiter"}
-	contextKeyForwardLimiter    = &contextKey{"reverse-forward-limiter"}
-	contextKeyServerSettings    = &contextKey{"server-settings"}
-	contextKeyConnectionWorkers = &contextKey{"connection-workers"}
-	contextKeyAuthConflicts     = &contextKey{"auth-callback-conflicts"}
-	contextKeyRequestReply      = &contextKey{"request-reply"}
+	contextKeyChannelLimiter      = &contextKey{"channel-limiter"}
+	contextKeyForwardLimiter      = &contextKey{"reverse-forward-limiter"}
+	contextKeyServerSettings      = &contextKey{"server-settings"}
+	contextKeyConnectionWorkers   = &contextKey{"connection-workers"}
+	contextKeyConnectionResources = &contextKey{"connection-resources"}
+	contextKeyAuthConflicts       = &contextKey{"auth-callback-conflicts"}
+	contextKeyRequestReply        = &contextKey{"request-reply"}
 
 	// ContextKeyUser is a context key for use with Contexts in this package.
 	// The associated value will be of type string.
@@ -79,6 +80,123 @@ type connectionWorkers struct {
 	mu     sync.Mutex
 	wg     sync.WaitGroup
 	closed bool
+}
+
+type connectionResource struct {
+	close func()
+}
+
+type connectionResources struct {
+	mu                  sync.Mutex
+	resources           map[*connectionResource]struct{}
+	pendingAcquisitions int
+	acquisitionsDrained chan struct{}
+	closed              bool
+	closeDone           chan struct{}
+}
+
+func (r *connectionResources) register(closeFn func()) func() {
+	resource := &connectionResource{close: closeFn}
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		closeFn()
+		return func() {}
+	}
+	if r.resources == nil {
+		r.resources = make(map[*connectionResource]struct{})
+	}
+	r.resources[resource] = struct{}{}
+	r.mu.Unlock()
+	return sync.OnceFunc(func() {
+		r.mu.Lock()
+		delete(r.resources, resource)
+		r.mu.Unlock()
+	})
+}
+
+func (r *connectionResources) closeAll() {
+	r.mu.Lock()
+	if r.closed {
+		done := r.closeDone
+		r.mu.Unlock()
+		<-done
+		return
+	}
+	r.closed = true
+	r.closeDone = make(chan struct{})
+	resources := make([]*connectionResource, 0, len(r.resources))
+	for resource := range r.resources {
+		resources = append(resources, resource)
+	}
+	clear(r.resources)
+	var acquisitionsDrained <-chan struct{}
+	if r.pendingAcquisitions > 0 {
+		r.acquisitionsDrained = make(chan struct{})
+		acquisitionsDrained = r.acquisitionsDrained
+	}
+	r.mu.Unlock()
+	for _, resource := range resources {
+		resource.close()
+	}
+	if acquisitionsDrained != nil {
+		<-acquisitionsDrained
+	}
+	close(r.closeDone)
+}
+
+func registerConnectionResource(ctx Context, closeFn func()) func() {
+	resources, _ := ctx.Value(contextKeyConnectionResources).(*connectionResources)
+	if resources == nil {
+		return func() {}
+	}
+	return resources.register(closeFn)
+}
+
+func beginConnectionResourceAcquisition(ctx Context) (func(func()) func(), bool) {
+	resources, _ := ctx.Value(contextKeyConnectionResources).(*connectionResources)
+	if resources == nil {
+		return func(func()) func() { return func() {} }, true
+	}
+	resources.mu.Lock()
+	if resources.closed {
+		resources.mu.Unlock()
+		return nil, false
+	}
+	resources.pendingAcquisitions++
+	resources.mu.Unlock()
+	return func(closeFn func()) func() {
+		resources.mu.Lock()
+		closed := resources.closed
+		var unregister func()
+		if !closed && closeFn != nil {
+			resource := &connectionResource{close: closeFn}
+			if resources.resources == nil {
+				resources.resources = make(map[*connectionResource]struct{})
+			}
+			resources.resources[resource] = struct{}{}
+			unregister = sync.OnceFunc(func() {
+				resources.mu.Lock()
+				delete(resources.resources, resource)
+				resources.mu.Unlock()
+			})
+		}
+		resources.mu.Unlock()
+		if closed && closeFn != nil {
+			closeFn()
+		}
+		resources.mu.Lock()
+		resources.pendingAcquisitions--
+		if resources.closed && resources.pendingAcquisitions == 0 && resources.acquisitionsDrained != nil {
+			close(resources.acquisitionsDrained)
+			resources.acquisitionsDrained = nil
+		}
+		resources.mu.Unlock()
+		if unregister == nil {
+			return func() {}
+		}
+		return unregister
+	}, true
 }
 
 func (w *connectionWorkers) goRun(fn func()) bool {
@@ -164,7 +282,12 @@ type sshContext struct {
 }
 
 func newContext(srv *Server) (*sshContext, context.CancelFunc) {
-	innerCtx, cancel := context.WithCancel(context.Background())
+	ctx, cancelCause := newContextWithParent(context.Background(), srv)
+	return ctx, func() { cancelCause(context.Canceled) }
+}
+
+func newContextWithParent(parent context.Context, srv *Server) (*sshContext, context.CancelCauseFunc) {
+	innerCtx, cancel := context.WithCancelCause(context.WithoutCancel(parent))
 	ctx := &sshContext{Context: innerCtx, Mutex: &sync.Mutex{}, values: make(map[any]any)}
 	ctx.SetValue(ContextKeyServer, srv)
 	perms := &Permissions{&gossh.Permissions{}}

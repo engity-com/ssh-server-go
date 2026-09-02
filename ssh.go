@@ -1,6 +1,7 @@
 package ssh
 
 import (
+	"context"
 	"crypto/subtle"
 	"net"
 	"sync"
@@ -141,28 +142,32 @@ type Pty struct {
 // Serve accepts incoming SSH connections on the listener l, creating a new
 // connection goroutine for each. The connection goroutines read requests and
 // then calls handler to handle sessions. Handler is typically nil, in which
-// case the DefaultHandler is used.
-func Serve(l net.Listener, handler Handler, options ...Option) error {
+// case the DefaultHandler is used. Canceling ctx stops this Serve scope. The
+// returned error contains the context cause and may contain cleanup errors or
+// ErrGracefulShutdownTimeout; callers should inspect it with errors.Is.
+func Serve(ctx context.Context, l net.Listener, handler Handler, options ...Option) error {
 	srv := &Server{Handler: handler}
 	for _, option := range options {
 		if err := srv.SetOption(option); err != nil {
 			return err
 		}
 	}
-	return srv.Serve(l)
+	return srv.Serve(ctx, l)
 }
 
 // ListenAndServe listens on the TCP network address addr and then calls Serve
 // with handler to handle sessions on incoming connections. Handler is typically
-// nil, in which case the DefaultHandler is used.
-func ListenAndServe(addr string, handler Handler, options ...Option) error {
+// nil, in which case the DefaultHandler is used. Canceling ctx stops the server.
+// The returned error contains the context cause and may contain cleanup errors
+// or ErrGracefulShutdownTimeout; callers should inspect it with errors.Is.
+func ListenAndServe(ctx context.Context, addr string, handler Handler, options ...Option) error {
 	srv := &Server{Addr: addr, Handler: handler}
 	for _, option := range options {
 		if err := srv.SetOption(option); err != nil {
 			return err
 		}
 	}
-	return srv.ListenAndServe()
+	return srv.ListenAndServe(ctx)
 }
 
 // Handle registers the handler as the DefaultHandler.

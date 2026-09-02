@@ -2,6 +2,7 @@ package ssh
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -28,8 +29,7 @@ func (srv *Server) serveOnce(l net.Listener) error {
 		"direct-tcpip":                   DirectTCPIPHandler,
 		"direct-streamlocal@openssh.com": DirectStreamLocalHandler,
 	}
-	srv.HandleConn(conn)
-	return nil
+	return srv.HandleConn(context.Background(), conn)
 }
 
 func newLocalListener() net.Listener {
@@ -70,15 +70,17 @@ func newClientSession(t *testing.T, addr string, config *gossh.ClientConfig) (*g
 
 func newTestSession(t *testing.T, srv *Server, cfg *gossh.ClientConfig) (*gossh.Session, *gossh.Client, func()) {
 	l := newLocalListener()
+	serveDone := make(chan error, 1)
 	go func() {
-		if err := srv.serveOnce(l); err != nil {
-			t.Error(err)
-		}
+		serveDone <- srv.serveOnce(l)
 	}()
 	session, client, cleanup := newClientSession(t, l.Addr().String(), cfg)
 	return session, client, func() {
 		cleanup()
 		closeQuietly(l)
+		if err := <-serveDone; err != nil {
+			t.Error(err)
+		}
 	}
 }
 

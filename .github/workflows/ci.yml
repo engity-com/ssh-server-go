@@ -93,6 +93,7 @@ jobs:
     strategy:
       matrix:
         example:
+          - ssh-gracefulshutdown
           - ssh-forwardagent
           - ssh-localforward
           - ssh-proxy-protocol

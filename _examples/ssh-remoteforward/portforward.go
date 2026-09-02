@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"io"
 	"log"
 
@@ -27,5 +28,5 @@ func main() {
 
 	log.Println("DEVELOPMENT ONLY: anonymous authentication and an ephemeral host key")
 	log.Println("starting SSH server on 127.0.0.1:2222; connect with ssh -N -R ...")
-	log.Fatal(server.ListenAndServe())
+	log.Fatal(server.ListenAndServe(context.Background()))
 }
