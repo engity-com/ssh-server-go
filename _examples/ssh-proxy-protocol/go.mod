@@ -1,13 +1,10 @@
-module github.com/engity-com/ssh-server-go/_examples/ssh-pty
+module github.com/engity-com/ssh-server-go/_examples/ssh-proxy-protocol
 
 go 1.27.0
 
 replace github.com/engity-com/ssh-server-go => ../..
 
-require (
-	github.com/creack/pty v1.1.24
-	github.com/engity-com/ssh-server-go v0.0.0
-)
+require github.com/engity-com/ssh-server-go v0.0.0
 
 require (
 	github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be // indirect

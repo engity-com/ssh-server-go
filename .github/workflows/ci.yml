@@ -95,6 +95,7 @@ jobs:
         example:
           - ssh-forwardagent
           - ssh-localforward
+          - ssh-proxy-protocol
           - ssh-pty
           - ssh-publickey
           - ssh-remoteforward
