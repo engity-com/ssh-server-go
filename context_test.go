@@ -1,6 +1,7 @@
 package ssh
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -67,14 +68,17 @@ func TestSetValueConcurrency(t *testing.T) {
 	ctx, cancel := newContext(nil)
 	defer cancel()
 
+	var wg sync.WaitGroup
+	wg.Add(2)
 	go func() {
+		defer wg.Done()
 		for { // use a loop to access context.Context functions to make sure they are thread-safe with SetValue
 			_, _ = ctx.Deadline()
 			_ = ctx.Err()
 			_ = ctx.Value("foo")
 			select {
 			case <-ctx.Done():
-				break
+				return
 			default:
 			}
 		}
@@ -83,6 +87,7 @@ func TestSetValueConcurrency(t *testing.T) {
 	now := time.Now()
 	var cnt int64
 	go func() {
+		defer wg.Done()
 		for time.Since(now) < 100*time.Millisecond {
 			cnt++
 			ctx.SetValue("foo", cnt) // a context value which changes a lot
@@ -90,6 +95,7 @@ func TestSetValueConcurrency(t *testing.T) {
 		cancel()
 	}()
 	<-ctx.Done()
+	wg.Wait()
 	if ctx.Value("foo") != cnt {
 		t.Fatal("context.Value(foo) doesn't match latest SetValue")
 	}
