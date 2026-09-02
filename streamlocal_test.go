@@ -464,9 +464,17 @@ func TestReverseStreamLocalRespectsChannelLimit(t *testing.T) {
 	defer closeQuietly(listener)
 	peer := serverListener.connect(t)
 	defer closeQuietly(peer)
-	require.NoError(t, peer.SetReadDeadline(time.Now().Add(time.Second)))
-	_, err = peer.Read(make([]byte, 1))
-	require.Error(t, err)
+	readResult := make(chan error, 1)
+	go func() {
+		_, err := peer.Read(make([]byte, 1))
+		readResult <- err
+	}()
+	select {
+	case err = <-readResult:
+		require.Error(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("channel-limited connection was not closed")
+	}
 }
 
 func TestReverseStreamLocalListenerClosesBeforeDisconnectCallback(t *testing.T) {
