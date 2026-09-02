@@ -98,6 +98,7 @@ type Server struct {
 	AgentForwardingCallback       AgentForwardingCallback       // callback for allowing agent forwarding, denies all if nil
 
 	ConnectionFailedCallback ConnectionFailedCallback // callback to report connection failures
+	DisconnectCallback       DisconnectCallback       // callback after an established SSH connection ends
 
 	// Timeout fields use their Default* value when nil. A configured duration
 	// less than or equal to zero disables that timeout.
@@ -156,6 +157,7 @@ type connectionSettings struct {
 	logger                        log.Logger
 	connCallback                  ConnCallback
 	connectionFailedCallback      ConnectionFailedCallback
+	disconnectCallback            DisconnectCallback
 	handler                       Handler
 	ptyCallback                   PtyCallback
 	sessionRequestCallback        SessionRequestCallback
@@ -201,6 +203,7 @@ func (srv *Server) connectionSettings() *connectionSettings {
 		logger:                        srv.Logger,
 		connCallback:                  srv.ConnCallback,
 		connectionFailedCallback:      srv.ConnectionFailedCallback,
+		disconnectCallback:            srv.DisconnectCallback,
 		handler:                       handler,
 		ptyCallback:                   srv.PtyCallback,
 		sessionRequestCallback:        srv.SessionRequestCallback,
@@ -908,6 +911,18 @@ func (srv *Server) handleConn(newConn net.Conn, active *activeConn, settings ...
 		return
 	}
 	srv.releaseStartup(active)
+	ctx.SetValue(ContextKeyConn, sshConn)
+	applyConnMetadata(ctx, sshConn)
+	publishAuthPermissions(ctx, sshConn.Permissions)
+	if connectionSettings.disconnectCallback != nil {
+		defer func() {
+			cancel()
+			closeQuietly(sshConn)
+			srv.untrackActiveConn(active)
+			tracked = false
+			connectionSettings.disconnectCallback(ctx, conn)
+		}()
+	}
 	connectionLimiter := resourceLimiter{
 		limit:  int64(connectionSettings.maxConnections),
 		active: connectionSettings.authenticatedConnections,
@@ -923,9 +938,6 @@ func (srv *Server) handleConn(newConn net.Conn, active *activeConn, settings ...
 	srv.trackConn(sshConn, true)
 	defer srv.trackConn(sshConn, false)
 
-	ctx.SetValue(ContextKeyConn, sshConn)
-	applyConnMetadata(ctx, sshConn)
-	publishAuthPermissions(ctx, sshConn.Permissions)
 	maxSessions := connectionSettings.maxSessionsPerConnection
 	maxChannels := connectionSettings.maxChannelsPerConnection
 	globalChannelLimiter := &resourceLimiter{

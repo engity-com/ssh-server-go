@@ -86,6 +86,120 @@ func TestHandleConnInitializesHostSigner(t *testing.T) {
 	srv.mu.RUnlock()
 }
 
+func TestDisconnectCallbackWaitsForConnectionWorkers(t *testing.T) {
+	type observation struct {
+		ctxErr        error
+		user          string
+		sessionID     string
+		serverConn    *gossh.ServerConn
+		connectionErr error
+	}
+
+	handlerStarted := make(chan struct{})
+	handlerCanceled := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(releaseHandler) })
+	disconnected := make(chan observation, 1)
+	var calls atomic.Int32
+	srv := &Server{
+		Handler: func(session Session) {
+			close(handlerStarted)
+			<-session.Context().Done()
+			close(handlerCanceled)
+			<-releaseHandler
+		},
+		DisconnectCallback: func(ctx Context, conn net.Conn) {
+			calls.Add(1)
+			_, connectionErr := conn.Write([]byte("closed"))
+			serverConn, _ := ctx.Value(ContextKeyConn).(*gossh.ServerConn)
+			disconnected <- observation{
+				ctxErr:        ctx.Err(),
+				user:          ctx.User(),
+				sessionID:     ctx.SessionID(),
+				serverConn:    serverConn,
+				connectionErr: connectionErr,
+			}
+		},
+	}
+	session, client, cleanup := newTestSession(t, srv, nil)
+	defer cleanup()
+	require.NoError(t, session.Start(""))
+	<-handlerStarted
+	require.NoError(t, session.Close())
+	require.Never(t, func() bool { return calls.Load() != 0 }, 20*time.Millisecond, time.Millisecond)
+
+	require.NoError(t, client.Close())
+	<-handlerCanceled
+	require.Zero(t, calls.Load(), "callback ran before the connection worker stopped")
+	releaseOnce.Do(func() { close(releaseHandler) })
+
+	select {
+	case got := <-disconnected:
+		require.ErrorIs(t, got.ctxErr, context.Canceled)
+		require.Equal(t, "testuser", got.user)
+		require.NotEmpty(t, got.sessionID)
+		require.NotNil(t, got.serverConn)
+		require.Error(t, got.connectionErr)
+	case <-time.After(time.Second):
+		t.Fatal("disconnect callback was not called")
+	}
+	require.Never(t, func() bool { return calls.Load() > 1 }, 20*time.Millisecond, time.Millisecond)
+}
+
+func TestDisconnectCallbackRunsAfterServerClose(t *testing.T) {
+	disconnected := make(chan error, 1)
+	var calls atomic.Int32
+	srv := &Server{DisconnectCallback: func(ctx Context, _ net.Conn) {
+		calls.Add(1)
+		disconnected <- ctx.Err()
+	}}
+	session, client, cleanup := newTestSession(t, srv, nil)
+	defer cleanup()
+	defer closeQuietly(session)
+	defer closeQuietly(client)
+
+	require.NoError(t, srv.Close())
+	select {
+	case err := <-disconnected:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("disconnect callback was not called after server close")
+	}
+	require.NoError(t, srv.Close())
+	require.Never(t, func() bool { return calls.Load() > 1 }, 20*time.Millisecond, time.Millisecond)
+}
+
+func TestDisconnectCallbackCanShutdownServer(t *testing.T) {
+	shutdownResult := make(chan error, 1)
+	var srv *Server
+	srv = &Server{DisconnectCallback: func(Context, net.Conn) {
+		shutdownResult <- srv.Shutdown(context.Background())
+	}}
+	l := newLocalListener()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- srv.Serve(l) }()
+	t.Cleanup(func() {
+		_ = srv.Close()
+		closeQuietly(l)
+	})
+	client, err := gossh.Dial("tcp", l.Addr().String(), &gossh.ClientConfig{
+		User:            "user",
+		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
+	})
+	require.NoError(t, err)
+	defer closeQuietly(client)
+	require.NoError(t, client.Close())
+
+	select {
+	case err := <-shutdownResult:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("disconnect callback deadlocked while shutting down the server")
+	}
+	require.ErrorIs(t, <-serveDone, ErrServerClosed)
+}
+
 func TestHandleConnReportsRequiredHostSigner(t *testing.T) {
 	callbackResult := make(chan error, 1)
 	srv := &Server{RequireHostSigners: true}
@@ -287,8 +401,10 @@ func TestConnectionSettingsSnapshot(t *testing.T) {
 	timeout := time.Second
 	oldHandlerCalled := false
 	oldChannelHandlerCalled := false
+	oldDisconnectCallbackCalled := false
 	srv := &Server{
-		Handler: func(Session) { oldHandlerCalled = true },
+		Handler:            func(Session) { oldHandlerCalled = true },
+		DisconnectCallback: func(Context, net.Conn) { oldDisconnectCallbackCalled = true },
 		ChannelHandlers: map[string]ChannelHandler{
 			"test": func(*Server, *gossh.ServerConn, gossh.NewChannel, Context) {
 				oldChannelHandlerCalled = true
@@ -299,14 +415,17 @@ func TestConnectionSettingsSnapshot(t *testing.T) {
 
 	settings := srv.connectionSettings()
 	srv.Handle(func(Session) { t.Fatal("snapshot used updated handler") })
+	srv.DisconnectCallback = func(Context, net.Conn) { t.Fatal("snapshot used updated disconnect callback") }
 	srv.ChannelHandlers["test"] = func(*Server, *gossh.ServerConn, gossh.NewChannel, Context) {
 		t.Fatal("snapshot used updated channel handler")
 	}
 	timeout = 2 * time.Second
 
 	settings.handler(nil)
+	settings.disconnectCallback(nil, nil)
 	settings.channelHandlers["test"](nil, nil, nil, nil)
 	require.True(t, oldHandlerCalled)
+	require.True(t, oldDisconnectCallbackCalled)
 	require.True(t, oldChannelHandlerCalled)
 	require.Equal(t, time.Second, settings.handshakeTimeout)
 }
@@ -1118,11 +1237,79 @@ func TestMaxStartupsRejectsConnectionsAtFullLimit(t *testing.T) {
 	require.ErrorIs(t, <-serveDone, ErrServerClosed)
 }
 
+func TestDisconnectCallbackRunsForAuthenticatedConnectionLimitRejection(t *testing.T) {
+	type observation struct {
+		user          string
+		hasServerConn bool
+	}
+
+	maxConnections := 1
+	disconnected := make(chan observation, 2)
+	s := &Server{
+		MaxConnections: &maxConnections,
+		DisconnectCallback: func(ctx Context, _ net.Conn) {
+			disconnected <- observation{
+				user:          ctx.User(),
+				hasServerConn: ctx.Value(ContextKeyConn) != nil,
+			}
+		},
+	}
+	l := newLocalListener()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- s.Serve(l) }()
+	var clients []*gossh.Client
+	t.Cleanup(func() {
+		for _, client := range clients {
+			closeQuietly(client)
+		}
+		_ = s.Close()
+		closeQuietly(l)
+		select {
+		case <-serveDone:
+		case <-time.After(time.Second):
+			t.Error("server did not stop during test cleanup")
+		}
+	})
+	clientConfig := func(user string) *gossh.ClientConfig {
+		return &gossh.ClientConfig{User: user, HostKeyCallback: gossh.InsecureIgnoreHostKey()}
+	}
+
+	first, err := gossh.Dial("tcp", l.Addr().String(), clientConfig("first"))
+	require.NoError(t, err)
+	clients = append(clients, first)
+	require.Eventually(t, func() bool {
+		return s.authenticatedConnections.Load() == 1
+	}, time.Second, time.Millisecond)
+
+	second, _ := gossh.Dial("tcp", l.Addr().String(), clientConfig("second"))
+	if second != nil {
+		clients = append(clients, second)
+		closeQuietly(second)
+	}
+	select {
+	case got := <-disconnected:
+		require.Equal(t, "second", got.user)
+		require.True(t, got.hasServerConn)
+	case <-time.After(time.Second):
+		t.Fatal("connection-limit rejection did not invoke disconnect callback")
+	}
+
+	require.NoError(t, first.Close())
+	select {
+	case got := <-disconnected:
+		require.Equal(t, "first", got.user)
+		require.True(t, got.hasServerConn)
+	case <-time.After(time.Second):
+		t.Fatal("accepted connection did not invoke disconnect callback")
+	}
+}
+
 func TestFailedHandshakeReleasesStartupBeforeCallback(t *testing.T) {
 	l := newLocalListener()
 	callbackEntered := make(chan struct{})
 	releaseCallback := make(chan struct{})
 	var callbackOnce sync.Once
+	var disconnectCalls atomic.Int32
 	s := &Server{
 		MaxStartups: &MaxStartupsConfig{Start: 1, Full: 1},
 		ConnectionFailedCallback: func(net.Conn, error) {
@@ -1131,6 +1318,7 @@ func TestFailedHandshakeReleasesStartupBeforeCallback(t *testing.T) {
 				<-releaseCallback
 			})
 		},
+		DisconnectCallback: func(Context, net.Conn) { disconnectCalls.Add(1) },
 	}
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- s.Serve(l) }()
@@ -1145,6 +1333,7 @@ func TestFailedHandshakeReleasesStartupBeforeCallback(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("connection failure callback was not called")
 	}
+	require.Zero(t, disconnectCalls.Load())
 
 	second, err := net.Dial("tcp", l.Addr().String())
 	require.NoError(t, err)
