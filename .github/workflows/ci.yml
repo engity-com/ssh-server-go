@@ -94,6 +94,7 @@ jobs:
       matrix:
         example:
           - ssh-forwardagent
+          - ssh-localforward
           - ssh-pty
           - ssh-publickey
           - ssh-remoteforward
