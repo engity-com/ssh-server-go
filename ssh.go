@@ -81,6 +81,23 @@ type LocalPortForwardingCallback func(ctx Context, destinationHost string, desti
 // ReversePortForwardingCallback is a hook for allowing reverse port forwarding
 type ReversePortForwardingCallback func(ctx Context, bindHost string, bindPort uint32) bool
 
+// LocalUnixForwardingCallback handles a direct-streamlocal@openssh.com request.
+// A successful callback transfers ownership of the returned connection to the
+// server. Return [ErrServerPermissionDenied] to reject the request without
+// exposing an operational error to the client. Implementations must honor
+// context cancellation.
+type LocalUnixForwardingCallback func(ctx Context, socketPath string) (net.Conn, error)
+
+// ReverseUnixForwardingCallback handles a streamlocal-forward@openssh.com
+// request. A successful callback transfers ownership of the returned listener
+// to the server. Close must unblock Accept. Return [ErrServerPermissionDenied]
+// to reject the request without exposing an operational error to the client.
+// Path validation, socket creation, permissions, and stale-file handling are
+// application policy. Callbacks returning a *net.UnixListener must also choose
+// appropriate unlink-on-close behavior. Implementations must honor context
+// cancellation.
+type ReverseUnixForwardingCallback func(ctx Context, socketPath string) (net.Listener, error)
+
 // ServerConfigCallback customizes a fresh per-connection server config. Public
 // key multi-factor authentication must return PartialSuccessError from
 // VerifiedPublicKeyCallback, after key ownership has been proven. Configuring a

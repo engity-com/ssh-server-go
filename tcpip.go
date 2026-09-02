@@ -115,15 +115,42 @@ type forward struct {
 	listener net.Listener
 	done     chan struct{}
 	close    func()
+	pending  sync.WaitGroup
+	mu       sync.Mutex
+	closing  bool
 }
 
-func newForward(listener net.Listener) *forward {
+func newForward(listener net.Listener, onClose func()) *forward {
 	f := &forward{listener: listener, done: make(chan struct{})}
 	f.close = sync.OnceFunc(func() {
+		f.mu.Lock()
+		f.closing = true
+		f.mu.Unlock()
 		close(f.done)
 		closeQuietly(f.listener)
+		if onClose != nil {
+			onClose()
+		}
 	})
 	return f
+}
+
+func (f *forward) beginOpen() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closing {
+		return false
+	}
+	f.pending.Add(1)
+	return true
+}
+
+func (f *forward) endOpen() {
+	f.pending.Done()
+}
+
+func (f *forward) waitForPendingOpens() {
+	f.pending.Wait()
 }
 
 func (h *ForwardedTCPHandler) HandleSSHRequest(ctx Context, srv *Server, req *gossh.Request) (bool, []byte) {
@@ -152,23 +179,14 @@ func (h *ForwardedTCPHandler) HandleSSHRequest(ctx Context, srv *Server, req *go
 		if settings.reversePortForwardingCallback == nil || !settings.reversePortForwardingCallback(ctx, reqPayload.BindAddr, reqPayload.BindPort) {
 			return false, []byte("port forwarding is disabled")
 		}
-		maxForwards := settings.maxReverseForwards
-		if maxForwards > 0 {
-			h.Lock()
-			forwardCount := 0
-			for key := range h.forwards {
-				if key.conn == conn {
-					forwardCount++
-				}
-			}
-			h.Unlock()
-			if forwardCount >= maxForwards {
-				return false, []byte("too many reverse port forwards")
-			}
+		forwardLimiter, _ := ctx.Value(contextKeyForwardLimiter).(*resourceLimiter)
+		if !forwardLimiter.reserve() {
+			return false, []byte("too many reverse port forwards")
 		}
 		addr := net.JoinHostPort(reqPayload.BindAddr, strconv.Itoa(int(reqPayload.BindPort)))
 		ln, err := net.Listen("tcp", addr)
 		if err != nil {
+			forwardLimiter.release()
 			h.loggerOfConnection(conn).
 				WithError(err).
 				With("bind.addr", reqPayload.BindAddr).
@@ -179,7 +197,7 @@ func (h *ForwardedTCPHandler) HandleSSHRequest(ctx Context, srv *Server, req *go
 		_, destPortStr, _ := net.SplitHostPort(ln.Addr().String())
 		destPort, _ := strconv.ParseUint(destPortStr, 10, 16)
 		key := forwardKey{conn: conn, addr: net.JoinHostPort(reqPayload.BindAddr, destPortStr)}
-		f := newForward(ln)
+		f := newForward(ln, forwardLimiter.release)
 		h.Lock()
 		h.forwards[key] = f
 		h.Unlock()

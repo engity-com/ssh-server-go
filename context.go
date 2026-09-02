@@ -17,9 +17,11 @@ type contextKey struct {
 
 var (
 	contextKeyChannelLimiter    = &contextKey{"channel-limiter"}
+	contextKeyForwardLimiter    = &contextKey{"reverse-forward-limiter"}
 	contextKeyServerSettings    = &contextKey{"server-settings"}
 	contextKeyConnectionWorkers = &contextKey{"connection-workers"}
 	contextKeyAuthConflicts     = &contextKey{"auth-callback-conflicts"}
+	contextKeyRequestReply      = &contextKey{"request-reply"}
 
 	// ContextKeyUser is a context key for use with Contexts in this package.
 	// The associated value will be of type string.
@@ -62,6 +64,16 @@ var (
 	// The associated value will be of type PublicKey.
 	ContextKeyPublicKey = &contextKey{"public-key"}
 )
+
+type requestReply struct {
+	done chan struct{}
+	err  error
+}
+
+func (r *requestReply) complete(err error) {
+	r.err = err
+	close(r.done)
+}
 
 type connectionWorkers struct {
 	mu     sync.Mutex

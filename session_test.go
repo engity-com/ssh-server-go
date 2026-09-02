@@ -24,8 +24,9 @@ func (srv *Server) serveOnce(l net.Listener) error {
 		return e
 	}
 	srv.ChannelHandlers = map[string]ChannelHandler{
-		"session":      DefaultSessionHandler,
-		"direct-tcpip": DirectTCPIPHandler,
+		"session":                        DefaultSessionHandler,
+		"direct-tcpip":                   DirectTCPIPHandler,
+		"direct-streamlocal@openssh.com": DirectStreamLocalHandler,
 	}
 	srv.HandleConn(conn)
 	return nil
