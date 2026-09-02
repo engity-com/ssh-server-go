@@ -42,6 +42,7 @@ facilities or programs.
 * [License](LICENSE)
 * [Code of Conduct](CODE_OF_CONDUCT.md)
 * [Contributing](CONTRIBUTING.md)
+* [Security Policy](SECURITY.md)
 
 ## Acknowledgements
 
