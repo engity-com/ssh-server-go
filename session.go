@@ -59,8 +59,10 @@ type Session interface {
 	// non-nil and holds the same data as the Context passed into auth
 	// handlers and callbacks.
 	//
-	// The context is canceled when the client's connection closes or I/O
-	// operation fails.
+	// Values are inherited from the context passed to Serve or HandleConn. Its
+	// cancellation and deadline are intentionally detached during graceful
+	// shutdown. The connection context is canceled when the connection closes,
+	// an I/O operation fails, or a hard shutdown begins.
 	Context() Context
 
 	// Permissions returns a copy of the Permissions object that was available for

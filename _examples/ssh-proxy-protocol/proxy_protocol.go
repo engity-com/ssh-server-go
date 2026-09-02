@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 
@@ -20,5 +21,5 @@ func main() {
 
 	log.Println("DEVELOPMENT ONLY: anonymous authentication, an ephemeral host key and trusts the PROXY protocol from everywhere.")
 	log.Printf("starting PROXY-aware SSH server on %s", listenAddress)
-	log.Fatal(server.ListenAndServe())
+	log.Fatal(server.ListenAndServe(context.Background()))
 }

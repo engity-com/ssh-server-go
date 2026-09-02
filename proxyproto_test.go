@@ -1,6 +1,7 @@
 package ssh
 
 import (
+	"context"
 	"errors"
 	"net"
 	"sync/atomic"
@@ -59,11 +60,12 @@ func TestProxyProtocolReportsHeaderAddresses(t *testing.T) {
 			}
 			listener := newLocalListener()
 			serveDone := make(chan error, 1)
-			go func() { serveDone <- srv.Serve(listener) }()
+			ctx, cancel := context.WithCancel(context.Background())
+			go func() { serveDone <- srv.Serve(ctx, listener) }()
 			t.Cleanup(func() {
-				_ = srv.Close()
-				if err := <-serveDone; !errors.Is(err, ErrServerClosed) {
-					t.Errorf("Serve() error = %v; want %v", err, ErrServerClosed)
+				cancel()
+				if err := <-serveDone; !errors.Is(err, context.Canceled) {
+					t.Errorf("Serve() error = %v; want %v", err, context.Canceled)
 				}
 			})
 
@@ -134,19 +136,17 @@ func TestProxyProtocolConnPolicyCanSkipHeaderProcessing(t *testing.T) {
 
 func TestProxyProtocolConnPolicyRejectsConnection(t *testing.T) {
 	expected := errors.New("untrusted proxy")
-	failure := make(chan error, 1)
 	srv := &Server{
 		ProxyProtocol: &ProxyProtocolConfig{ConnPolicy: func(proxyproto.ConnPolicyOptions) (proxyproto.Policy, error) {
 			return proxyproto.REJECT, expected
 		}},
-		ConnectionFailedCallback: func(_ net.Conn, err error) { failure <- err },
 	}
 	serverConn, clientConn := net.Pipe()
 	defer closeQuietly(clientConn)
-	srv.HandleConn(serverConn)
-	require.ErrorIs(t, <-failure, expected)
+	err := srv.HandleConn(context.Background(), serverConn)
+	require.ErrorIs(t, err, expected)
 	_ = clientConn.SetReadDeadline(time.Now().Add(time.Second))
-	_, err := clientConn.Read(make([]byte, 1))
+	_, err = clientConn.Read(make([]byte, 1))
 	require.Error(t, err)
 }
 
@@ -176,7 +176,6 @@ func TestProxyProtocolRejectPolicyRejectsHeader(t *testing.T) {
 func TestProxyProtocolValidatorRejectsHeader(t *testing.T) {
 	expected := errors.New("invalid proxy metadata")
 	var callbackCalls atomic.Int32
-	failure := make(chan error, 1)
 	srv := &Server{
 		ProxyProtocol: &ProxyProtocolConfig{ValidateHeader: func(*proxyproto.Header) error {
 			return expected
@@ -185,15 +184,12 @@ func TestProxyProtocolValidatorRejectsHeader(t *testing.T) {
 			callbackCalls.Add(1)
 			return conn
 		},
-		ConnectionFailedCallback: func(_ net.Conn, err error) { failure <- err },
 	}
 	serverConn, clientConn := net.Pipe()
 	defer closeQuietly(clientConn)
-	t.Cleanup(func() { _ = srv.Close() })
-	done := make(chan struct{})
+	done := make(chan error, 1)
 	go func() {
-		defer close(done)
-		srv.HandleConn(serverConn)
+		done <- srv.HandleConn(context.Background(), serverConn)
 	}()
 	writeDone := make(chan error, 1)
 	go func() {
@@ -206,63 +202,53 @@ func TestProxyProtocolValidatorRejectsHeader(t *testing.T) {
 		}).WriteTo(clientConn)
 		writeDone <- err
 	}()
-	require.ErrorIs(t, <-failure, expected)
+	require.ErrorIs(t, <-done, expected)
 	require.NoError(t, <-writeDone)
-	<-done
 	require.Equal(t, int32(1), callbackCalls.Load())
 }
 
 func TestProxyProtocolReadHeaderTimeout(t *testing.T) {
-	failure := make(chan error, 1)
 	srv := &Server{
-		ProxyProtocol:            &ProxyProtocolConfig{ReadHeaderTimeout: 20 * time.Millisecond},
-		ConnectionFailedCallback: func(_ net.Conn, err error) { failure <- err },
+		ProxyProtocol: &ProxyProtocolConfig{ReadHeaderTimeout: 20 * time.Millisecond},
 	}
 	serverConn, clientConn := net.Pipe()
 	defer closeQuietly(clientConn)
-	t.Cleanup(func() { _ = srv.Close() })
-	done := make(chan struct{})
+	done := make(chan error, 1)
 	go func() {
-		defer close(done)
-		srv.HandleConn(serverConn)
+		done <- srv.HandleConn(context.Background(), serverConn)
 	}()
 	select {
-	case err := <-failure:
+	case err := <-done:
 		require.ErrorIs(t, err, proxyproto.ErrNoProxyProtocol)
 	case <-time.After(time.Second):
 		t.Fatal("PROXY header timeout did not reject the connection")
 	}
-	<-done
 }
 
 func TestProxyProtocolHonorsEarlierHandshakeTimeout(t *testing.T) {
 	headerTimeout := time.Second
 	handshakeTimeout := 20 * time.Millisecond
-	failure := make(chan error, 1)
 	srv := &Server{
-		ProxyProtocol:            &ProxyProtocolConfig{ReadHeaderTimeout: headerTimeout},
-		HandshakeTimeout:         &handshakeTimeout,
-		ConnectionFailedCallback: func(_ net.Conn, err error) { failure <- err },
+		ProxyProtocol:    &ProxyProtocolConfig{ReadHeaderTimeout: headerTimeout},
+		HandshakeTimeout: &handshakeTimeout,
 	}
 	serverConn, clientConn := net.Pipe()
 	defer closeQuietly(clientConn)
 	started := time.Now()
-	done := make(chan struct{})
+	done := make(chan error, 1)
 	go func() {
-		defer close(done)
-		srv.HandleConn(serverConn)
+		done <- srv.HandleConn(context.Background(), serverConn)
 	}()
 	select {
-	case err := <-failure:
+	case err := <-done:
 		require.Error(t, err)
 		require.Less(t, time.Since(started), headerTimeout)
 	case <-time.After(time.Second):
 		t.Fatal("SSH handshake timeout did not stop PROXY header processing")
 	}
-	<-done
 }
 
-func TestServerCloseStopsProxyProtocolHeaderRead(t *testing.T) {
+func TestHandleConnContextStopsProxyProtocolHeaderRead(t *testing.T) {
 	disabledTimeout := time.Duration(0)
 	srv := &Server{
 		ProxyProtocol:    &ProxyProtocolConfig{ReadHeaderTimeout: -1},
@@ -270,16 +256,14 @@ func TestServerCloseStopsProxyProtocolHeaderRead(t *testing.T) {
 	}
 	serverConn, clientConn := net.Pipe()
 	defer closeQuietly(clientConn)
-	t.Cleanup(func() { _ = srv.Close() })
+	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		srv.HandleConn(serverConn)
+		_ = srv.HandleConn(ctx, serverConn)
 	}()
 	require.Eventually(t, func() bool {
-		srv.mu.RLock()
-		defer srv.mu.RUnlock()
-		return len(srv.activeConns) == 1
+		return activeConnectionCount(srv) == 1
 	}, time.Second, time.Millisecond)
 	writeDone := make(chan error, 1)
 	go func() {
@@ -292,15 +276,13 @@ func TestServerCloseStopsProxyProtocolHeaderRead(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("PROXY header processing did not start")
 	}
-	require.NoError(t, srv.Close())
+	cancel()
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("Server.Close did not stop PROXY header processing")
+		t.Fatal("context cancellation did not stop PROXY header processing")
 	}
-	srv.mu.RLock()
-	require.Empty(t, srv.activeConns)
-	srv.mu.RUnlock()
+	require.Zero(t, activeConnectionCount(srv))
 }
 
 func TestProxyProtocolRejectsAlreadyWrappedConnection(t *testing.T) {

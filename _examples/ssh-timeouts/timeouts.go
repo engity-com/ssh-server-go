@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"time"
 
@@ -37,5 +38,5 @@ func main() {
 	log.Println("DEVELOPMENT ONLY: anonymous authentication and an ephemeral host key")
 	log.Println("starting ssh server on 127.0.0.1:2222...")
 	log.Printf("connections will only last %s and timeout after %s of no activity\n", DeadlineTimeout, IdleTimeout)
-	log.Fatal(server.ListenAndServe())
+	log.Fatal(server.ListenAndServe(context.Background()))
 }

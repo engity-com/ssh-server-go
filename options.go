@@ -1,11 +1,36 @@
 package ssh
 
 import (
+	"context"
 	"errors"
 	"os"
+	"time"
 
 	gossh "golang.org/x/crypto/ssh"
 )
+
+// NewGracefulShutdownTimeoutHandler returns a graceful shutdown handler that
+// always uses timeout.
+func NewGracefulShutdownTimeoutHandler(timeout time.Duration) GracefulShutdownHandler {
+	return func(context.Context) time.Duration {
+		return timeout
+	}
+}
+
+// WithGracefulShutdownHandler returns a functional option that sets the
+// graceful shutdown handler on the server.
+func WithGracefulShutdownHandler(handler GracefulShutdownHandler) Option {
+	return func(srv *Server) error {
+		srv.GracefulShutdownHandler = handler
+		return nil
+	}
+}
+
+// WithGracefulShutdownTimeout returns a functional option that configures a
+// fixed graceful shutdown timeout on the server.
+func WithGracefulShutdownTimeout(timeout time.Duration) Option {
+	return WithGracefulShutdownHandler(NewGracefulShutdownTimeoutHandler(timeout))
+}
 
 // PasswordAuth returns a functional option that sets PasswordHandler on the server.
 func PasswordAuth(fn PasswordHandler) Option {

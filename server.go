@@ -3,9 +3,7 @@ package ssh
 import (
 	"context"
 	"errors"
-	"io"
 	"maps"
-	"math/rand/v2"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -17,9 +15,9 @@ import (
 )
 
 var (
-	// ErrServerClosed is returned by [Server.Serve] and [Server.ListenAndServe]
-	// after a call to [Server.Shutdown] or [Server.Close].
-	ErrServerClosed = errors.New("ssh: Server closed")
+	// ErrGracefulShutdownTimeout is joined into the returned error when a
+	// context-triggered graceful shutdown exceeds its configured period.
+	ErrGracefulShutdownTimeout = errors.New("ssh: graceful shutdown timeout")
 
 	ErrServerPermissionDenied     = errors.New("permission denied")
 	ErrServerHostSignerRequired   = errors.New("ssh: at least one persistent host signer is required")
@@ -43,6 +41,10 @@ type ChannelHandler func(srv *Server, conn *gossh.ServerConn, newChan gossh.NewC
 var DefaultChannelHandlers = map[string]ChannelHandler{
 	"session": DefaultSessionHandler,
 }
+
+// GracefulShutdownHandler determines how long a context-triggered shutdown
+// waits for connections to drain before closing them.
+type GracefulShutdownHandler func(context.Context) time.Duration
 
 const (
 	DefaultHandshakeTimeout                = 2 * time.Minute
@@ -101,6 +103,11 @@ type Server struct {
 
 	ConnectionFailedCallback ConnectionFailedCallback // callback to report connection failures
 	DisconnectCallback       DisconnectCallback       // callback after an established SSH connection ends
+	// GracefulShutdownHandler determines how long a context-triggered shutdown
+	// waits for connections to drain before closing them. It is called once with
+	// the original canceled context after the listener has been closed and must
+	// return promptly. Nil or a nonpositive result disables graceful shutdown.
+	GracefulShutdownHandler GracefulShutdownHandler
 
 	// ProxyProtocol enables PROXY protocol processing when non-nil. Connection
 	// wrapping occurs before ConnCallback and the SSH handshake. Do not pass
@@ -140,28 +147,26 @@ type Server struct {
 	configMu                 sync.Mutex
 	mu                       sync.RWMutex
 	generatedHostKey         PublicKey
-	listeners                map[net.Listener]struct{}
-	conns                    map[*gossh.ServerConn]struct{}
-	activeConns              map[*activeConn]struct{}
+	scopes                   map[*serveScope]struct{}
 	startups                 int
 	authenticatedConnections *atomic.Int64
 	globalChannels           *atomic.Int64
 	configuring              bool
-	doneChan                 chan struct{}
-	drainedChan              chan struct{}
-}
-
-type activeConn struct {
-	conn            net.Conn
-	cancel          context.CancelFunc
-	acceptedAt      time.Time
-	handshaking     bool
-	startupReserved bool
-	closed          bool
 }
 
 type connectionSettings struct {
 	logger                        log.Logger
+	serverConfigCallback          ServerConfigCallback
+	ciphers                       Ciphers
+	keyExchanges                  KeyExchanges
+	messageAuthentications        MessageAuthentications
+	hostSigners                   []Signer
+	passwordHandler               PasswordHandler
+	publicKeyHandler              PublicKeyHandler
+	keyboardInteractiveHandler    KeyboardInteractiveHandler
+	version                       string
+	banner                        string
+	bannerHandler                 BannerHandler
 	connCallback                  ConnCallback
 	connectionFailedCallback      ConnectionFailedCallback
 	disconnectCallback            DisconnectCallback
@@ -216,6 +221,17 @@ func (srv *Server) connectionSettings() *connectionSettings {
 	}
 	return &connectionSettings{
 		logger:                        srv.Logger,
+		serverConfigCallback:          srv.ServerConfigCallback,
+		ciphers:                       append(Ciphers(nil), srv.Ciphers...),
+		keyExchanges:                  append(KeyExchanges(nil), srv.KeyExchanges...),
+		messageAuthentications:        append(MessageAuthentications(nil), srv.MessageAuthentications...),
+		hostSigners:                   append([]Signer(nil), srv.HostSigners...),
+		passwordHandler:               srv.PasswordHandler,
+		publicKeyHandler:              srv.PublicKeyHandler,
+		keyboardInteractiveHandler:    srv.KeyboardInteractiveHandler,
+		version:                       srv.Version,
+		banner:                        srv.Banner,
+		bannerHandler:                 srv.BannerHandler,
 		connCallback:                  srv.ConnCallback,
 		connectionFailedCallback:      srv.ConnectionFailedCallback,
 		disconnectCallback:            srv.DisconnectCallback,
@@ -327,33 +343,22 @@ func (srv *Server) ensureHandlers() {
 }
 
 func (srv *Server) config(ctx Context) *gossh.ServerConfig {
-	srv.mu.RLock()
-	serverConfigCallback := srv.ServerConfigCallback
-	ciphers := append(Ciphers(nil), srv.Ciphers...)
-	keyExchanges := append(KeyExchanges(nil), srv.KeyExchanges...)
-	messageAuthentications := append(MessageAuthentications(nil), srv.MessageAuthentications...)
-	hostSigners := append([]Signer(nil), srv.HostSigners...)
-	passwordHandler := srv.PasswordHandler
-	publicKeyHandler := srv.PublicKeyHandler
-	keyboardInteractiveHandler := srv.KeyboardInteractiveHandler
-	version := srv.Version
-	banner := srv.Banner
-	bannerHandler := srv.BannerHandler
-	requireClientAuth := srv.RequireClientAuth
-	srv.mu.RUnlock()
+	return srv.configWithSettings(ctx, srv.connectionSettings())
+}
 
+func (srv *Server) configWithSettings(ctx Context, settings *connectionSettings) *gossh.ServerConfig {
 	config := &gossh.ServerConfig{}
-	if serverConfigCallback != nil {
-		serverConfigCallback(ctx, config)
+	if settings.serverConfigCallback != nil {
+		settings.serverConfigCallback(ctx, config)
 	}
 	customBannerCallback := config.BannerCallback
 	customPasswordCallback := config.PasswordCallback
 	customPublicKeyCallback := config.PublicKeyCallback
 	customKeyboardInteractiveCallback := config.KeyboardInteractiveCallback
 	ctx.SetValue(contextKeyAuthConflicts, authCallbackConflicts{
-		password:            passwordHandler != nil,
-		publicKey:           publicKeyHandler != nil,
-		keyboardInteractive: keyboardInteractiveHandler != nil,
+		password:            settings.passwordHandler != nil,
+		publicKey:           settings.publicKeyHandler != nil,
+		keyboardInteractive: settings.keyboardInteractiveHandler != nil,
 	})
 	preAuthConnCallback := config.PreAuthConnCallback
 	if preAuthConnCallback != nil {
@@ -371,7 +376,8 @@ func (srv *Server) config(ctx Context) *gossh.ServerConfig {
 			authLogCallback(conn, method, err)
 		}
 	}
-	if !ciphers.IsEmpty() || len(config.Ciphers) == 0 {
+	if !settings.ciphers.IsEmpty() || len(config.Ciphers) == 0 {
+		ciphers := settings.ciphers
 		if ciphers.IsEmpty() {
 			ciphers = DefaultCiphers
 		}
@@ -380,7 +386,8 @@ func (srv *Server) config(ctx Context) *gossh.ServerConfig {
 			config.Ciphers[i] = cipher.String()
 		}
 	}
-	if !keyExchanges.IsEmpty() || len(config.KeyExchanges) == 0 {
+	if !settings.keyExchanges.IsEmpty() || len(config.KeyExchanges) == 0 {
+		keyExchanges := settings.keyExchanges
 		if keyExchanges.IsEmpty() {
 			keyExchanges = DefaultKeyExchanges
 		}
@@ -389,7 +396,8 @@ func (srv *Server) config(ctx Context) *gossh.ServerConfig {
 			config.KeyExchanges[i] = keyExchange.String()
 		}
 	}
-	if !messageAuthentications.IsEmpty() || len(config.MACs) == 0 {
+	if !settings.messageAuthentications.IsEmpty() || len(config.MACs) == 0 {
+		messageAuthentications := settings.messageAuthentications
 		if messageAuthentications.IsEmpty() {
 			messageAuthentications = DefaultMessageAuthentications
 		}
@@ -398,28 +406,28 @@ func (srv *Server) config(ctx Context) *gossh.ServerConfig {
 			config.MACs[i] = messageAuthentication.String()
 		}
 	}
-	for _, signer := range hostSigners {
+	for _, signer := range settings.hostSigners {
 		config.AddHostKey(signer)
 	}
-	if !requireClientAuth && passwordHandler == nil && publicKeyHandler == nil && keyboardInteractiveHandler == nil &&
+	if !settings.requireClientAuth && settings.passwordHandler == nil && settings.publicKeyHandler == nil && settings.keyboardInteractiveHandler == nil &&
 		config.PasswordCallback == nil && config.PublicKeyCallback == nil &&
 		config.KeyboardInteractiveCallback == nil && config.GSSAPIWithMICConfig == nil {
 		config.NoClientAuth = true
 	}
-	if version != "" {
-		config.ServerVersion = "SSH-2.0-" + version
+	if settings.version != "" {
+		config.ServerVersion = "SSH-2.0-" + settings.version
 	}
-	if banner != "" {
+	if settings.banner != "" {
 		config.BannerCallback = func(_ gossh.ConnMetadata) string {
-			return banner
+			return settings.banner
 		}
 	}
-	if bannerHandler != nil {
+	if settings.bannerHandler != nil {
 		config.BannerCallback = func(conn gossh.ConnMetadata) string {
 			applyConnMetadata(ctx, conn)
-			return bannerHandler(ctx)
+			return settings.bannerHandler(ctx)
 		}
-	} else if banner == "" && customBannerCallback != nil {
+	} else if settings.banner == "" && customBannerCallback != nil {
 		config.BannerCallback = func(conn gossh.ConnMetadata) string {
 			applyConnMetadata(ctx, conn)
 			return customBannerCallback(conn)
@@ -441,7 +449,7 @@ func (srv *Server) config(ctx Context) *gossh.ServerConfig {
 			return permissions, nil
 		}
 	}
-	if passwordHandler != nil {
+	if settings.passwordHandler != nil {
 		if customPasswordCallback != nil {
 			config.PasswordCallback = func(gossh.ConnMetadata, []byte) (*gossh.Permissions, error) {
 				return nil, ErrServerAuthCallbackConflict
@@ -450,7 +458,7 @@ func (srv *Server) config(ctx Context) *gossh.ServerConfig {
 			config.PasswordCallback = func(conn gossh.ConnMetadata, password []byte) (*gossh.Permissions, error) {
 				applyConnMetadata(ctx, conn)
 				permissions := beginAuthAttempt(ctx)
-				if ok := passwordHandler(ctx, string(password)); !ok {
+				if ok := settings.passwordHandler(ctx, string(password)); !ok {
 					return permissions, ErrServerPermissionDenied
 				}
 				return permissions, nil
@@ -459,7 +467,7 @@ func (srv *Server) config(ctx Context) *gossh.ServerConfig {
 	} else if config.PasswordCallback != nil {
 		config.PasswordCallback = wrapPasswordCallback(ctx, config.PasswordCallback)
 	}
-	if publicKeyHandler != nil {
+	if settings.publicKeyHandler != nil {
 		verifiedPublicKeyCallback := config.VerifiedPublicKeyCallback
 		if customPublicKeyCallback != nil {
 			config.PublicKeyCallback = func(gossh.ConnMetadata, gossh.PublicKey) (*gossh.Permissions, error) {
@@ -469,7 +477,7 @@ func (srv *Server) config(ctx Context) *gossh.ServerConfig {
 			config.PublicKeyCallback = func(conn gossh.ConnMetadata, key gossh.PublicKey) (*gossh.Permissions, error) {
 				applyConnMetadata(ctx, conn)
 				permissions := beginAuthAttempt(ctx)
-				if ok := publicKeyHandler(ctx, key); !ok {
+				if ok := settings.publicKeyHandler(ctx, key); !ok {
 					return permissions, ErrServerPermissionDenied
 				}
 				return permissions, nil
@@ -523,7 +531,7 @@ func (srv *Server) config(ctx Context) *gossh.ServerConfig {
 			return permissions, nil
 		}
 	}
-	if keyboardInteractiveHandler != nil {
+	if settings.keyboardInteractiveHandler != nil {
 		if customKeyboardInteractiveCallback != nil {
 			config.KeyboardInteractiveCallback = func(gossh.ConnMetadata, gossh.KeyboardInteractiveChallenge) (*gossh.Permissions, error) {
 				return nil, ErrServerAuthCallbackConflict
@@ -532,7 +540,7 @@ func (srv *Server) config(ctx Context) *gossh.ServerConfig {
 			config.KeyboardInteractiveCallback = func(conn gossh.ConnMetadata, challenger gossh.KeyboardInteractiveChallenge) (*gossh.Permissions, error) {
 				applyConnMetadata(ctx, conn)
 				permissions := beginAuthAttempt(ctx)
-				if ok := keyboardInteractiveHandler(ctx, challenger); !ok {
+				if ok := settings.keyboardInteractiveHandler(ctx, challenger); !ok {
 					return permissions, ErrServerPermissionDenied
 				}
 				return permissions, nil
@@ -709,95 +717,27 @@ func (srv *Server) Handle(fn Handler) {
 	srv.Handler = fn
 }
 
-// Close immediately closes all active listeners and all active
-// connections.
-//
-// Close returns any error returned from closing the Server's
-// underlying Listener(s).
-func (srv *Server) Close() error {
-	srv.mu.Lock()
-	srv.closeDoneChanLocked()
-	listeners := srv.listenersLocked()
-	connections := make([]io.Closer, 0, len(srv.conns)+len(srv.activeConns))
-	for c := range srv.conns {
-		connections = append(connections, c)
-	}
-	cancels := make([]context.CancelFunc, 0, len(srv.activeConns))
-	for c := range srv.activeConns {
-		c.closed = true
-		if c.cancel != nil {
-			cancels = append(cancels, c.cancel)
-		}
-		connections = append(connections, c.conn)
-	}
-	srv.maybeCloseDrainedLocked()
-	srv.mu.Unlock()
-
-	for _, cancel := range cancels {
-		cancel()
-	}
-	err := closeListeners(listeners)
-	for _, conn := range connections {
-		closeQuietly(conn)
-	}
-	return err
-}
-
-// Shutdown gracefully shuts down the server without interrupting any
-// active connections. Shutdown works by first closing all open
-// listeners, and then waiting indefinitely for connections to close.
-// If the provided context expires before the shutdown is complete,
-// then the context's error is returned.
-func (srv *Server) Shutdown(ctx context.Context) error {
-	srv.mu.Lock()
-	srv.closeDoneChanLocked()
-	listeners := srv.listenersLocked()
-	drained := srv.getDrainedChanLocked()
-	srv.mu.Unlock()
-	err := closeListeners(listeners)
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-drained:
-		return err
-	}
-}
-
 // Serve accepts incoming connections on the Listener l, creating a new
 // connection goroutine for each. The connection goroutines read requests and then
-// calls srv.Handler to handle sessions.
-//
-// Serve always returns a non-nil error.
-func (srv *Server) Serve(l net.Listener) error {
-	for {
-		srv.waitForPreviousGeneration()
-		srv.configMu.Lock()
-		srv.ensureHandlers()
-		if err := srv.ensureHostSigner(); err != nil {
-			srv.configMu.Unlock()
-			closeQuietly(l)
-			return err
-		}
-		if srv.trackListener(l, true) {
-			srv.configMu.Unlock()
-			break
-		}
-		srv.configMu.Unlock()
+// calls srv.Handler to handle sessions. Canceling ctx closes the listener and
+// stops this Serve scope; other concurrent Serve calls on srv are unaffected.
+// Serve returns the context cause after draining or forcibly closing the
+// scope's connections. A forced shutdown after a positive graceful period also
+// returns ErrGracefulShutdownTimeout.
+func (srv *Server) Serve(ctx context.Context, l net.Listener) error {
+	scope, err := srv.startScope(ctx, l)
+	if err != nil {
+		return err
 	}
-	defer closeQuietly(l)
+	defer srv.finishScope(scope)
 	var tempDelay time.Duration
-
-	defer srv.trackListener(l, false)
 	for {
-		conn, e := l.Accept()
-		if e != nil {
-			select {
-			case <-srv.getDoneChan():
-				return ErrServerClosed
-			default:
+		conn, acceptErr := l.Accept()
+		if acceptErr != nil {
+			if ctx.Err() != nil {
+				return scope.shutdown(ctx, scope.gracefulShutdownHandler)
 			}
-			if ne, ok := errors.AsType[net.Error](e); ok && ne.Temporary() {
+			if ne, ok := errors.AsType[net.Error](acceptErr); ok && ne.Temporary() {
 				if tempDelay == 0 {
 					tempDelay = 5 * time.Millisecond
 				} else {
@@ -806,58 +746,86 @@ func (srv *Server) Serve(l net.Listener) error {
 				if v := 1 * time.Second; tempDelay > v {
 					tempDelay = v
 				}
-				time.Sleep(tempDelay)
+				timer := time.NewTimer(tempDelay)
+				select {
+				case <-ctx.Done():
+					if !timer.Stop() {
+						<-timer.C
+					}
+					return scope.shutdown(ctx, scope.gracefulShutdownHandler)
+				case <-timer.C:
+				}
 				continue
 			}
-			return e
+			return errors.Join(acceptErr, scope.force(acceptErr))
 		}
-		if active := srv.trackActiveConn(conn, false); active != nil {
-			go srv.handleConn(conn, active)
+		tempDelay = 0
+		if active := scope.trackConnection(conn); active != nil {
+			settings := srv.connectionSettings()
+			go func() {
+				_ = srv.handleConn(scope.parent, conn, active, true, settings)
+			}()
 		}
 	}
 }
 
-func (srv *Server) HandleConn(newConn net.Conn) {
-	active := srv.trackActiveConn(newConn, true)
-	if active == nil {
-		return
-	}
-	srv.configMu.Lock()
-	srv.ensureHandlers()
-	if err := srv.ensureHostSigner(); err != nil {
-		srv.mu.RLock()
-		connectionFailedCallback := srv.ConnectionFailedCallback
-		srv.mu.RUnlock()
-		srv.configMu.Unlock()
-		srv.untrackActiveConn(active)
+// HandleConn handles one connection until it finishes or ctx is canceled. It
+// returns connection failures directly and does not invoke
+// ConnectionFailedCallback. On cancellation, the returned error contains the
+// context cause and may contain cleanup errors or ErrGracefulShutdownTimeout.
+func (srv *Server) HandleConn(ctx context.Context, newConn net.Conn) error {
+	scope, err := srv.startScope(ctx, nil)
+	if err != nil {
 		closeQuietly(newConn)
-		if connectionFailedCallback != nil {
-			connectionFailedCallback(newConn, err)
+		return err
+	}
+	defer srv.finishScope(scope)
+	active := scope.trackConnection(newConn)
+	if active == nil {
+		if ctx.Err() != nil {
+			return scope.shutdown(ctx, scope.gracefulShutdownHandler)
 		}
-		return
+		return nil
 	}
 	settings := srv.connectionSettings()
-	srv.configMu.Unlock()
-	srv.handleConn(newConn, active, settings)
+	result := make(chan error, 1)
+	go func() {
+		result <- srv.handleConn(scope.parent, newConn, active, false, settings)
+	}()
+	select {
+	case err := <-result:
+		return err
+	case <-ctx.Done():
+		select {
+		case err := <-result:
+			return err
+		default:
+			return scope.shutdown(ctx, scope.gracefulShutdownHandler)
+		}
+	}
 }
 
-func (srv *Server) handleConn(newConn net.Conn, active *activeConn, settings ...*connectionSettings) {
+func (srv *Server) handleConn(parent context.Context, newConn net.Conn, active *activeConn, reportFailure bool, connectionSettings *connectionSettings) error {
 	tracked := true
 	defer func() {
 		if tracked {
-			srv.untrackActiveConn(active)
+			active.scope.untrackConnection(active)
 		}
 	}()
-	ctx, cancel := newContext(srv)
+	ctx, cancelCause := newContextWithParent(parent, srv)
+	cancel := func() { cancelCause(context.Canceled) }
 	defer cancel()
-	connectionSettings := srv.connectionSettings()
-	if len(settings) > 0 {
-		connectionSettings = settings[0]
+	fail := func(conn net.Conn, err error) error {
+		if reportFailure && connectionSettings.connectionFailedCallback != nil {
+			connectionSettings.connectionFailedCallback(conn, err)
+		}
+		return err
 	}
 	ctx.SetValue(contextKeyServerSettings, connectionSettings)
-	if !srv.updateActiveCancel(active, cancel) {
+	ctx.SetValue(contextKeyConnectionResources, active.resources)
+	if !active.scope.updateCancel(active, cancelCause) {
 		closeQuietly(newConn)
-		return
+		return active.scope.connectionCause(active)
 	}
 	handshakeTimeout := connectionSettings.handshakeTimeout
 	var handshakeDeadline time.Time
@@ -870,36 +838,30 @@ func (srv *Server) handleConn(newConn net.Conn, active *activeConn, settings ...
 		maxDeadline = active.acceptedAt.Add(maxTimeout)
 	}
 	handshakeTimer := cancelAt(handshakeDeadline, func() {
-		srv.mu.RLock()
-		handshaking := active.handshaking
-		srv.mu.RUnlock()
-		if handshaking {
-			cancel()
+		if active.scope.isHandshaking(active) {
+			cancelCause(context.DeadlineExceeded)
 		}
 	})
 	if handshakeTimer != nil {
 		defer handshakeTimer.Stop()
 	}
-	maxTimer := cancelAt(maxDeadline, cancel)
+	maxTimer := cancelAt(maxDeadline, func() { cancelCause(context.DeadlineExceeded) })
 	if maxTimer != nil {
 		defer maxTimer.Stop()
 	}
 	if v := connectionSettings.proxyProtocol; v != nil {
 		proxyConn, err := wrapProxyProtocolConn(newConn, *v)
 		if err != nil {
-			srv.releaseStartup(active)
+			active.scope.releaseStartup(active)
 			closeQuietly(newConn)
-			srv.untrackActiveConn(active)
+			active.scope.untrackConnection(active)
 			tracked = false
-			if connectionSettings.connectionFailedCallback != nil {
-				connectionSettings.connectionFailedCallback(newConn, err)
-			}
-			return
+			return fail(newConn, err)
 		}
 		newConn = proxyConn
-		if !srv.updateActiveConn(active, proxyConn) {
+		if !active.scope.updateConnection(active, proxyConn) {
 			closeQuietly(proxyConn)
-			return
+			return active.scope.connectionCause(active)
 		}
 	}
 	_ = newConn.SetDeadline(earliestDeadline(handshakeDeadline, maxDeadline))
@@ -907,12 +869,12 @@ func (srv *Server) handleConn(newConn net.Conn, active *activeConn, settings ...
 		cbConn := v(ctx, newConn)
 		if cbConn == nil {
 			closeQuietly(newConn)
-			return
+			return nil
 		}
 		newConn = cbConn
-		if !srv.updateActiveConn(active, cbConn) {
+		if !active.scope.updateConnection(active, cbConn) {
 			closeQuietly(cbConn)
-			return
+			return active.scope.connectionCause(active)
 		}
 	}
 	idleTimeout := connectionSettings.idleTimeout
@@ -925,30 +887,24 @@ func (srv *Server) handleConn(newConn net.Conn, active *activeConn, settings ...
 	}
 	conn.updateDeadline()
 	defer closeQuietly(conn)
-	serverConfig := srv.config(ctx)
+	serverConfig := srv.configWithSettings(ctx, connectionSettings)
 	if connectionSettings.requireClientAuth && !serverConfigHasClientAuth(serverConfig) {
 		err := ErrServerClientAuthRequired
-		srv.releaseStartup(active)
+		active.scope.releaseStartup(active)
 		closeQuietly(conn)
-		srv.untrackActiveConn(active)
+		active.scope.untrackConnection(active)
 		tracked = false
-		if connectionSettings.connectionFailedCallback != nil {
-			connectionSettings.connectionFailedCallback(conn, err)
-		}
-		return
+		return fail(conn, err)
 	}
 	sshConn, chans, reqs, err := gossh.NewServerConn(conn, serverConfig)
 	if err != nil {
-		srv.releaseStartup(active)
+		active.scope.releaseStartup(active)
 		closeQuietly(conn)
-		srv.untrackActiveConn(active)
+		active.scope.untrackConnection(active)
 		tracked = false
-		if connectionSettings.connectionFailedCallback != nil {
-			connectionSettings.connectionFailedCallback(conn, err)
-		}
-		return
+		return fail(conn, err)
 	}
-	srv.releaseStartup(active)
+	active.scope.releaseStartup(active)
 	ctx.SetValue(ContextKeyConn, sshConn)
 	applyConnMetadata(ctx, sshConn)
 	publishAuthPermissions(ctx, sshConn.Permissions)
@@ -956,7 +912,7 @@ func (srv *Server) handleConn(newConn net.Conn, active *activeConn, settings ...
 		defer func() {
 			cancel()
 			closeQuietly(sshConn)
-			srv.untrackActiveConn(active)
+			active.scope.untrackConnection(active)
 			tracked = false
 			connectionSettings.disconnectCallback(ctx, conn)
 		}()
@@ -966,16 +922,18 @@ func (srv *Server) handleConn(newConn net.Conn, active *activeConn, settings ...
 		active: connectionSettings.authenticatedConnections,
 	}
 	if !connectionLimiter.reserve() {
-		return
+		return nil
 	}
-	defer connectionLimiter.release()
+	connectionReserved := true
+	defer func() {
+		if connectionReserved {
+			connectionLimiter.release()
+		}
+	}()
 	if handshakeTimer != nil {
 		handshakeTimer.Stop()
 	}
 	conn.clearHandshakeDeadline()
-	srv.trackConn(sshConn, true)
-	defer srv.trackConn(sshConn, false)
-
 	maxSessions := connectionSettings.maxSessionsPerConnection
 	maxChannels := connectionSettings.maxChannelsPerConnection
 	globalChannelLimiter := &resourceLimiter{
@@ -1026,7 +984,13 @@ func (srv *Server) handleConn(newConn net.Conn, active *activeConn, settings ...
 	}
 	cancel()
 	closeQuietly(sshConn)
+	active.resources.closeAll()
+	active.scope.untrackConnection(active)
+	tracked = false
+	connectionLimiter.release()
+	connectionReserved = false
 	workers.closeAndWait()
+	return nil
 }
 
 func serverConfigHasClientAuth(config *gossh.ServerConfig) bool {
@@ -1151,18 +1115,18 @@ func (srv *Server) handleRequests(ctx Context, in <-chan *gossh.Request, handler
 }
 
 // ListenAndServe listens on the TCP network address srv.Addr and then calls
-// Serve to handle incoming connections. If srv.Addr is blank, ":22" is used.
-// ListenAndServe always returns a non-nil error.
-func (srv *Server) ListenAndServe() error {
+// Serve with ctx to handle incoming connections. If srv.Addr is blank, ":22"
+// is used. Its return value has the same error semantics as Serve.
+func (srv *Server) ListenAndServe(ctx context.Context) error {
 	addr := srv.Addr
 	if addr == "" {
 		addr = ":22"
 	}
-	ln, err := net.Listen("tcp", addr)
+	ln, err := new(net.ListenConfig).Listen(ctx, "tcp", addr)
 	if err != nil {
 		return err
 	}
-	return srv.Serve(ln)
+	return srv.Serve(ctx, ln)
 }
 
 // AddHostKey adds a private key as a host key. If an existing host key exists
@@ -1195,7 +1159,7 @@ func (srv *Server) SetOption(option Option) error {
 	srv.configMu.Lock()
 	defer srv.configMu.Unlock()
 	srv.mu.Lock()
-	running := len(srv.listeners) > 0 || len(srv.activeConns) > 0
+	running := len(srv.scopes) > 0
 	if running {
 		srv.mu.Unlock()
 		return ErrServerRunning
@@ -1208,233 +1172,6 @@ func (srv *Server) SetOption(option Option) error {
 		srv.mu.Unlock()
 	}()
 	return option(srv)
-}
-
-func (srv *Server) getDoneChan() <-chan struct{} {
-	srv.mu.Lock()
-	defer srv.mu.Unlock()
-
-	return srv.getDoneChanLocked()
-}
-
-func (srv *Server) getDoneChanLocked() chan struct{} {
-	if srv.doneChan == nil {
-		srv.doneChan = make(chan struct{})
-	}
-	return srv.doneChan
-}
-
-func (srv *Server) closeDoneChanLocked() {
-	ch := srv.getDoneChanLocked()
-	select {
-	case <-ch:
-		// Already closed. Don't close again.
-	default:
-		// Safe to close here. We're the only closer, guarded
-		// by srv.mu.
-		close(ch)
-	}
-}
-
-func (srv *Server) listenersLocked() []net.Listener {
-	listeners := make([]net.Listener, 0, len(srv.listeners))
-	for ln := range srv.listeners {
-		listeners = append(listeners, ln)
-	}
-	return listeners
-}
-
-func closeListeners(listeners []net.Listener) error {
-	var err error
-	for _, ln := range listeners {
-		if cErr := ln.Close(); cErr != nil && !isClosedError(cErr) && err == nil {
-			err = cErr
-		}
-	}
-	return err
-}
-
-func (srv *Server) trackListener(ln net.Listener, add bool) bool {
-	srv.mu.Lock()
-	defer srv.mu.Unlock()
-
-	if srv.listeners == nil {
-		srv.listeners = make(map[net.Listener]struct{})
-	}
-	if add {
-		if srv.isDoneLocked() && (len(srv.listeners) != 0 || len(srv.activeConns) != 0) {
-			return false
-		}
-		if len(srv.listeners) == 0 && len(srv.activeConns) == 0 {
-			srv.resetGenerationLocked()
-		}
-		srv.listeners[ln] = struct{}{}
-	} else {
-		delete(srv.listeners, ln)
-		srv.maybeCloseDrainedLocked()
-	}
-	return true
-}
-
-func (srv *Server) trackConn(c *gossh.ServerConn, add bool) {
-	srv.mu.Lock()
-	defer srv.mu.Unlock()
-
-	if srv.conns == nil {
-		srv.conns = make(map[*gossh.ServerConn]struct{})
-	}
-	if add {
-		srv.conns[c] = struct{}{}
-	} else {
-		delete(srv.conns, c)
-	}
-}
-
-func (srv *Server) trackActiveConn(conn net.Conn, allowReset bool) *activeConn {
-	srv.mu.Lock()
-	if srv.configuring {
-		srv.mu.Unlock()
-		closeQuietly(conn)
-		return nil
-	}
-	if allowReset && len(srv.listeners) == 0 && len(srv.activeConns) == 0 {
-		srv.resetGenerationLocked()
-	}
-	if srv.doneChan != nil {
-		select {
-		case <-srv.doneChan:
-			if allowReset && len(srv.listeners) == 0 && len(srv.activeConns) == 0 {
-				srv.resetGenerationLocked()
-			} else {
-				srv.mu.Unlock()
-				closeQuietly(conn)
-				return nil
-			}
-		default:
-		}
-	}
-	maxStartups := srv.effectiveMaxStartups()
-	dropRate := maxStartupsDropRate(srv.startups, maxStartups)
-	if dropRate >= 100 || dropRate > 0 && int(rand.UintN(100)) < dropRate {
-		srv.mu.Unlock()
-		closeQuietly(conn)
-		return nil
-	}
-	active := &activeConn{
-		conn:            conn,
-		acceptedAt:      time.Now(),
-		handshaking:     true,
-		startupReserved: maxStartups.Full > 0,
-	}
-	if srv.activeConns == nil {
-		srv.activeConns = make(map[*activeConn]struct{})
-	}
-	if srv.authenticatedConnections == nil || srv.globalChannels == nil {
-		srv.authenticatedConnections = &atomic.Int64{}
-		srv.globalChannels = &atomic.Int64{}
-	}
-	srv.activeConns[active] = struct{}{}
-	if active.startupReserved {
-		srv.startups++
-	}
-	srv.mu.Unlock()
-	return active
-}
-
-func (srv *Server) updateActiveConn(active *activeConn, conn net.Conn) bool {
-	srv.mu.Lock()
-	defer srv.mu.Unlock()
-	if _, ok := srv.activeConns[active]; !ok || active.closed {
-		return false
-	}
-	active.conn = conn
-	return true
-}
-
-func (srv *Server) updateActiveCancel(active *activeConn, cancel context.CancelFunc) bool {
-	srv.mu.Lock()
-	defer srv.mu.Unlock()
-	if _, ok := srv.activeConns[active]; !ok || active.closed {
-		return false
-	}
-	active.cancel = cancel
-	return true
-}
-
-func (srv *Server) untrackActiveConn(active *activeConn) {
-	srv.mu.Lock()
-	defer srv.mu.Unlock()
-	if active.startupReserved {
-		srv.startups--
-		active.startupReserved = false
-	}
-	active.handshaking = false
-	delete(srv.activeConns, active)
-	srv.maybeCloseDrainedLocked()
-}
-
-func (srv *Server) waitForPreviousGeneration() {
-	for {
-		srv.mu.Lock()
-		if !srv.isDoneLocked() || len(srv.listeners) == 0 && len(srv.activeConns) == 0 {
-			srv.mu.Unlock()
-			return
-		}
-		drained := srv.getDrainedChanLocked()
-		srv.mu.Unlock()
-		<-drained
-	}
-}
-
-func (srv *Server) resetGenerationLocked() {
-	srv.doneChan = make(chan struct{})
-	srv.drainedChan = make(chan struct{})
-	srv.authenticatedConnections = &atomic.Int64{}
-	srv.globalChannels = &atomic.Int64{}
-}
-
-func (srv *Server) isDoneLocked() bool {
-	if srv.doneChan == nil {
-		return false
-	}
-	select {
-	case <-srv.doneChan:
-		return true
-	default:
-		return false
-	}
-}
-
-func (srv *Server) getDrainedChanLocked() chan struct{} {
-	if srv.drainedChan == nil {
-		srv.drainedChan = make(chan struct{})
-	}
-	srv.maybeCloseDrainedLocked()
-	return srv.drainedChan
-}
-
-func (srv *Server) maybeCloseDrainedLocked() {
-	if len(srv.listeners) != 0 || len(srv.activeConns) != 0 {
-		return
-	}
-	if srv.drainedChan == nil {
-		srv.drainedChan = make(chan struct{})
-	}
-	select {
-	case <-srv.drainedChan:
-	default:
-		close(srv.drainedChan)
-	}
-}
-
-func (srv *Server) releaseStartup(active *activeConn) {
-	srv.mu.Lock()
-	defer srv.mu.Unlock()
-	active.handshaking = false
-	if active.startupReserved {
-		srv.startups--
-		active.startupReserved = false
-	}
 }
 
 func (srv *Server) effectiveMaxStartups() MaxStartupsConfig {

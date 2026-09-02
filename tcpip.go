@@ -47,9 +47,15 @@ func DirectTCPIPHandler(srv *Server, sshConn *gossh.ServerConn, newChan gossh.Ne
 
 	dest := net.JoinHostPort(d.DestAddr, strconv.FormatInt(int64(d.DestPort), 10))
 
+	finishAcquisition, ok := beginConnectionResourceAcquisition(ctx)
+	if !ok {
+		_ = newChan.Reject(gossh.ConnectionFailed, "connection is closing")
+		return
+	}
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, "tcp", dest)
 	if err != nil {
+		finishAcquisition(nil)
 		enrichLoggerForServerConnection(srv.logger(), sshConn).
 			WithError(err).
 			With("tcp.destination", dest).
@@ -57,6 +63,8 @@ func DirectTCPIPHandler(srv *Server, sshConn *gossh.ServerConn, newChan gossh.Ne
 		_ = newChan.Reject(gossh.ConnectionFailed, "connection failed")
 		return
 	}
+	unregisterConn := finishAcquisition(func() { closeQuietly(conn) })
+	defer unregisterConn()
 
 	ch, reqs, err := newChan.Accept()
 	if err != nil {
@@ -184,8 +192,14 @@ func (h *ForwardedTCPHandler) HandleSSHRequest(ctx Context, srv *Server, req *go
 			return false, []byte("too many reverse port forwards")
 		}
 		addr := net.JoinHostPort(reqPayload.BindAddr, strconv.Itoa(int(reqPayload.BindPort)))
-		ln, err := net.Listen("tcp", addr)
+		finishAcquisition, ok := beginConnectionResourceAcquisition(ctx)
+		if !ok {
+			forwardLimiter.release()
+			return false, []byte{}
+		}
+		ln, err := new(net.ListenConfig).Listen(ctx, "tcp", addr)
 		if err != nil {
+			finishAcquisition(nil)
 			forwardLimiter.release()
 			h.loggerOfConnection(conn).
 				WithError(err).
@@ -198,10 +212,12 @@ func (h *ForwardedTCPHandler) HandleSSHRequest(ctx Context, srv *Server, req *go
 		destPort, _ := strconv.ParseUint(destPortStr, 10, 16)
 		key := forwardKey{conn: conn, addr: net.JoinHostPort(reqPayload.BindAddr, destPortStr)}
 		f := newForward(ln, forwardLimiter.release)
+		unregisterForward := finishAcquisition(f.close)
 		h.Lock()
 		h.forwards[key] = f
 		h.Unlock()
 		started := startConnectionWorker(ctx, func() {
+			defer unregisterForward()
 			go func() {
 				select {
 				case <-ctx.Done():
@@ -211,11 +227,17 @@ func (h *ForwardedTCPHandler) HandleSSHRequest(ctx Context, srv *Server, req *go
 			}()
 			limiter, _ := ctx.Value(contextKeyChannelLimiter).(*connectionChannelLimiter)
 			for {
+				finishAcquisition, ok := beginConnectionResourceAcquisition(ctx)
+				if !ok {
+					break
+				}
 				c, err := ln.Accept()
 				if err != nil {
+					finishAcquisition(nil)
 					// TODO: log accept failure
 					break
 				}
+				unregisterConn := finishAcquisition(func() { closeQuietly(c) })
 				originAddr, orignPortStr, _ := net.SplitHostPort(c.RemoteAddr().String())
 				originPort, _ := strconv.ParseUint(orignPortStr, 10, 16)
 				payload := gossh.Marshal(&remoteForwardChannelData{
@@ -225,12 +247,14 @@ func (h *ForwardedTCPHandler) HandleSSHRequest(ctx Context, srv *Server, req *go
 					OriginPort: uint32(originPort),
 				})
 				if !limiter.reserve() {
+					unregisterConn()
 					closeQuietly(c)
 					h.loggerOfConnection(conn).
 						Warn("'tcpip-forward': too many open SSH channels; rejecting connection")
 					continue
 				}
 				if !startConnectionWorker(ctx, func() {
+					defer unregisterConn()
 					defer closeQuietly(c)
 					defer limiter.release()
 					ch, reqs, err := conn.OpenChannel(forwardedTCPChannelType, payload)
@@ -252,6 +276,7 @@ func (h *ForwardedTCPHandler) HandleSSHRequest(ctx Context, srv *Server, req *go
 							Warn("'tcpip-forward': failed to forward connection")
 					}
 				}) {
+					unregisterConn()
 					limiter.release()
 					closeQuietly(c)
 				}
@@ -264,6 +289,7 @@ func (h *ForwardedTCPHandler) HandleSSHRequest(ctx Context, srv *Server, req *go
 			f.close()
 		})
 		if !started {
+			unregisterForward()
 			h.Lock()
 			if h.forwards[key] == f {
 				delete(h.forwards, key)
