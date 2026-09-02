@@ -1,20 +1,8 @@
 package ssh
 
 import (
-	"crypto/rand"
-	"crypto/rsa"
 	"encoding/binary"
-
-	"golang.org/x/crypto/ssh"
 )
-
-func generateSigner() (ssh.Signer, error) {
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		return nil, err
-	}
-	return ssh.NewSignerFromKey(key)
-}
 
 func parsePtyRequest(s []byte) (pty Pty, ok bool) {
 	term, s, ok := parseString(s)
