@@ -14,6 +14,10 @@ import (
 )
 
 func setWinsize(f *os.File, w, h int) {
+	const maxUint16 = int(^uint16(0))
+	if w <= 0 || h <= 0 || w > maxUint16 || h > maxUint16 {
+		return
+	}
 	_, _, _ = syscall.Syscall(
 		syscall.SYS_IOCTL,
 		f.Fd(),
@@ -28,6 +32,8 @@ func main() {
 		ptyReq, winCh, isPty := s.Pty()
 		if isPty {
 			cmd.Env = append(cmd.Env, fmt.Sprintf("TERM=%s", ptyReq.Term))
+			// Applications can inspect ptyReq.TerminalModes and decide how to
+			// configure their PTY; the SSH server does not apply them.
 			f, err := pty.Start(cmd)
 			if err != nil {
 				panic(err)
