@@ -56,7 +56,9 @@ type PasswordHandler func(ctx Context, password string) bool
 // KeyboardInteractiveHandler is a callback for performing keyboard-interactive authentication.
 type KeyboardInteractiveHandler func(ctx Context, challenger gossh.KeyboardInteractiveChallenge) bool
 
-// PtyCallback is a hook for allowing PTY sessions.
+// PtyCallback is a hook for allowing PTY sessions. The Pty contains the
+// client's requested metadata; this package does not allocate or configure an
+// operating-system PTY.
 type PtyCallback func(ctx Context, pty Pty) bool
 
 // SessionRequestCallback is a callback for allowing or denying SSH sessions.
@@ -97,17 +99,26 @@ type ConnectionFailedCallback func(conn net.Conn, err error)
 // return promptly. Panics from the callback are not recovered.
 type DisconnectCallback func(ctx Context, conn net.Conn)
 
-// Window represents the size of a PTY window.
+// Window represents the informational dimensions of a PTY window. Width and
+// Height are measured in characters; WidthPixels and HeightPixels describe the
+// drawable area. A zero value in an initial PTY request means unspecified. A
+// zero value in a later window change leaves that dimension unchanged.
 type Window struct {
-	Width  int
-	Height int
+	Width        int
+	Height       int
+	WidthPixels  int
+	HeightPixels int
 }
 
-// Pty represents a PTY request and configuration.
+// Pty represents the metadata in an accepted PTY request. This package exposes
+// the requested values but does not allocate or configure an operating-system
+// PTY and does not interpret or apply TerminalModes.
 type Pty struct {
 	Term   string
 	Window Window
-	// HELP WANTED: terminal modes!
+	// TerminalModes contains the initial RFC 4254 terminal modes requested by
+	// the client. Callers may modify the map; each API boundary returns a copy.
+	TerminalModes gossh.TerminalModes
 }
 
 // Serve accepts incoming SSH connections on the listener l, creating a new

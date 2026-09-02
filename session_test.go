@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"testing"
 	"time"
@@ -218,42 +219,114 @@ func TestExitStatusNonZero(t *testing.T) {
 func TestPty(t *testing.T) {
 	t.Parallel()
 	term := "xterm"
-	winWidth := 40
-	winHeight := 80
-	done := make(chan bool)
+	wantWindow := Window{Width: 40, Height: 80, WidthPixels: 320, HeightPixels: 640}
+	terminalModes := gossh.TerminalModes{
+		gossh.ECHO:          1,
+		gossh.IUTF8:         1,
+		gossh.TTY_OP_OSPEED: 38400,
+	}
+	type handlerResult struct {
+		pty   Pty
+		isPty bool
+	}
+	result := make(chan handlerResult, 1)
 	session, _, cleanup := newTestSession(t, &Server{
+		PtyCallback: func(_ Context, pty Pty) bool {
+			pty.TerminalModes[gossh.ECHO] = 0
+			return true
+		},
 		Handler: func(s Session) {
 			ptyReq, _, isPty := s.Pty()
-			if !isPty {
-				t.Fatalf("expected pty but none requested")
-			}
-			if ptyReq.Term != term {
-				t.Fatalf("expected term %#v but got %#v", term, ptyReq.Term)
-			}
-			if ptyReq.Window.Width != winWidth {
-				t.Fatalf("expected window width %#v but got %#v", winWidth, ptyReq.Window.Width)
-			}
-			if ptyReq.Window.Height != winHeight {
-				t.Fatalf("expected window height %#v but got %#v", winHeight, ptyReq.Window.Height)
-			}
-			close(done)
+			result <- handlerResult{pty: ptyReq, isPty: isPty}
 		},
 	}, nil)
 	defer cleanup()
-	if err := session.RequestPty(term, winHeight, winWidth, gossh.TerminalModes{}); err != nil {
-		t.Fatalf("expected nil but got %v", err)
-	}
+	encodedModes := appendTerminalMode(nil, gossh.ECHO, terminalModes[gossh.ECHO])
+	encodedModes = appendTerminalMode(encodedModes, gossh.IUTF8, terminalModes[gossh.IUTF8])
+	encodedModes = appendTerminalMode(encodedModes, gossh.TTY_OP_OSPEED, terminalModes[gossh.TTY_OP_OSPEED])
+	encodedModes = append(encodedModes, 0)
+	ok, err := session.SendRequest("pty-req", true, marshalPtyRequest(term, wantWindow, encodedModes))
+	require.NoError(t, err)
+	require.True(t, ok)
 	if err := session.Shell(); err != nil {
 		t.Fatalf("expected nil but got %v", err)
 	}
-	<-done
+	got := <-result
+	require.True(t, got.isPty)
+	require.Equal(t, term, got.pty.Term)
+	require.Equal(t, wantWindow, got.pty.Window)
+	require.True(t, maps.Equal(terminalModes, got.pty.TerminalModes))
+}
+
+func TestPtyReturnsTerminalModesCopy(t *testing.T) {
+	sess := &session{pty: &Pty{TerminalModes: gossh.TerminalModes{gossh.ECHO: 1}}}
+	first, _, ok := sess.Pty()
+	require.True(t, ok)
+	first.TerminalModes[gossh.ECHO] = 0
+
+	second, _, ok := sess.Pty()
+	require.True(t, ok)
+	require.Equal(t, uint32(1), second.TerminalModes[gossh.ECHO])
+}
+
+func TestPtyTerminalModesAreMetadataOnly(t *testing.T) {
+	type handlerResult struct {
+		pty Pty
+		ok  bool
+		err error
+	}
+	run := func(modes gossh.TerminalModes) string {
+		result := make(chan handlerResult, 1)
+		session, _, cleanup := newTestSession(t, &Server{Handler: func(s Session) {
+			pty, _, ok := s.Pty()
+			_, err := io.WriteString(s, "line\n")
+			result <- handlerResult{pty: pty, ok: ok, err: err}
+		}}, nil)
+		defer cleanup()
+
+		var stdout bytes.Buffer
+		session.Stdout = &stdout
+		require.NoError(t, session.RequestPty("xterm", 24, 80, modes))
+		require.NoError(t, session.Run(""))
+		got := <-result
+		require.True(t, got.ok)
+		require.True(t, maps.Equal(modes, got.pty.TerminalModes))
+		require.NoError(t, got.err)
+		return stdout.String()
+	}
+
+	baseline := run(nil)
+	disabledOutputProcessing := run(gossh.TerminalModes{gossh.OPOST: 0, gossh.ONLCR: 0})
+	require.Equal(t, "line\r\n", baseline)
+	require.Equal(t, baseline, disabledOutputProcessing)
+}
+
+func TestPtyRejectsMalformedTerminalModesBeforeCallback(t *testing.T) {
+	callbackCalled := make(chan struct{}, 1)
+	session, _, cleanup := newTestSession(t, &Server{
+		Handler: func(Session) {},
+		PtyCallback: func(Context, Pty) bool {
+			callbackCalled <- struct{}{}
+			return true
+		},
+	}, nil)
+	defer cleanup()
+
+	ok, err := session.SendRequest("pty-req", true, marshalPtyRequest("xterm", Window{Width: 80, Height: 24}, []byte{gossh.ECHO}))
+	require.NoError(t, err)
+	require.False(t, ok)
+	select {
+	case <-callbackCalled:
+		t.Fatal("PTY callback was called for malformed terminal modes")
+	default:
+	}
 }
 
 func TestPtyResize(t *testing.T) {
 	t.Parallel()
-	winch0 := Window{40, 80}
-	winch1 := Window{80, 160}
-	winch2 := Window{20, 40}
+	winch0 := Window{Width: 40, Height: 80, WidthPixels: 320, HeightPixels: 640}
+	winch1 := Window{Width: 80, Height: 160, WidthPixels: 640, HeightPixels: 1280}
+	winch2 := Window{Width: 20, Height: 40, WidthPixels: 160, HeightPixels: 320}
 	winches := make(chan Window)
 	done := make(chan bool)
 	session, _, cleanup := newTestSession(t, &Server{
@@ -273,9 +346,9 @@ func TestPtyResize(t *testing.T) {
 	}, nil)
 	defer cleanup()
 	// winch0
-	if err := session.RequestPty("xterm", winch0.Height, winch0.Width, gossh.TerminalModes{}); err != nil {
-		t.Fatalf("expected nil but got %v", err)
-	}
+	ok, err := session.SendRequest("pty-req", true, marshalPtyRequest("xterm", winch0, []byte{0}))
+	require.NoError(t, err)
+	require.True(t, ok)
 	if err := session.Shell(); err != nil {
 		t.Fatalf("expected nil but got %v", err)
 	}
@@ -284,21 +357,15 @@ func TestPtyResize(t *testing.T) {
 		t.Fatalf("expected window %#v but got %#v", winch0, gotWinch)
 	}
 	// winch1
-	winchMsg := struct{ w, h uint32 }{uint32(winch1.Width), uint32(winch1.Height)}
-	ok, err := session.SendRequest("window-change", true, gossh.Marshal(&winchMsg))
-	if err == nil && !ok {
-		t.Fatalf("unexpected error or bad reply on send request")
-	}
+	ok, err = session.SendRequest("window-change", true, marshalWindow(winch1))
+	require.NoError(t, err)
+	require.True(t, ok)
 	gotWinch = <-winches
 	if gotWinch != winch1 {
 		t.Fatalf("expected window %#v but got %#v", winch1, gotWinch)
 	}
 	// winch2
-	winchMsg = struct{ w, h uint32 }{uint32(winch2.Width), uint32(winch2.Height)}
-	ok, err = session.SendRequest("window-change", true, gossh.Marshal(&winchMsg))
-	if err == nil && !ok {
-		t.Fatalf("unexpected error or bad reply on send request")
-	}
+	require.NoError(t, session.WindowChange(winch2.Height, winch2.Width))
 	gotWinch = <-winches
 	if gotWinch != winch2 {
 		t.Fatalf("expected window %#v but got %#v", winch2, gotWinch)
@@ -307,19 +374,38 @@ func TestPtyResize(t *testing.T) {
 	<-done
 }
 
-func TestPtyResizeDoesNotBlockWithoutConsumer(t *testing.T) {
-	session, _, cleanup := newTestSession(t, &Server{Handler: func(Session) {}}, nil)
+func TestPtyResizeCoalescesWithoutConsumer(t *testing.T) {
+	serverSession := make(chan Session, 1)
+	windowChanges := make(chan (<-chan Window), 1)
+	session, _, cleanup := newTestSession(t, &Server{Handler: func(s Session) {
+		_, winch, _ := s.Pty()
+		serverSession <- s
+		windowChanges <- winch
+		<-s.Context().Done()
+	}}, nil)
 	defer cleanup()
 	require.NoError(t, session.RequestPty("xterm", 80, 40, gossh.TerminalModes{}))
+	require.NoError(t, session.Shell())
+	sess := <-serverSession
+	winch := <-windowChanges
 
 	result := make(chan error, 1)
 	go func() {
-		payload := gossh.Marshal(&struct{ Width, Height uint32 }{80, 160})
-		ok, err := session.SendRequest("window-change", true, payload)
-		if err == nil && !ok {
-			err = errors.New("window change rejected")
+		for _, update := range []Window{
+			{Width: 80, Height: 160, WidthPixels: 640, HeightPixels: 1280},
+			{Height: 200, HeightPixels: 1440},
+		} {
+			ok, err := session.SendRequest("window-change", true, marshalWindow(update))
+			if err != nil {
+				result <- err
+				return
+			}
+			if !ok {
+				result <- errors.New("window change rejected")
+				return
+			}
 		}
-		result <- err
+		result <- nil
 	}()
 	select {
 	case err := <-result:
@@ -327,6 +413,12 @@ func TestPtyResizeDoesNotBlockWithoutConsumer(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("window change blocked without a consumer")
 	}
+
+	want := Window{Width: 80, Height: 200, WidthPixels: 640, HeightPixels: 1440}
+	require.Equal(t, want, <-winch)
+	pty, _, ok := sess.Pty()
+	require.True(t, ok)
+	require.Equal(t, want, pty.Window)
 }
 
 func TestPtyCanBeReadWhileWindowChanges(t *testing.T) {
@@ -347,7 +439,7 @@ func TestPtyCanBeReadWhileWindowChanges(t *testing.T) {
 	require.NoError(t, session.Shell())
 	<-started
 	for i := range 100 {
-		payload := gossh.Marshal(&struct{ Width, Height uint32 }{uint32(80 + i), 160})
+		payload := marshalWindow(Window{Width: 80 + i, Height: 160})
 		ok, err := session.SendRequest("window-change", true, payload)
 		require.NoError(t, err)
 		require.True(t, ok)

@@ -68,8 +68,12 @@ type Session interface {
 	// arbitrary values stored in ExtraData are not recursively cloned.
 	Permissions() Permissions
 
-	// Pty returns PTY information, a channel of window size changes, and a boolean
-	// of whether a PTY was accepted for this session.
+	// Pty returns the client's PTY request, a channel of effective window sizes,
+	// and whether a PTY was accepted for this session. The channel initially
+	// contains the size from the PTY request. If the receiver falls behind,
+	// intermediate changes are coalesced and the latest size is retained. The
+	// returned Pty and its TerminalModes map are snapshots and can be modified by
+	// the caller.
 	Pty() (Pty, <-chan Window, bool)
 
 	// Signals registers a channel to receive signals sent from the client. The
@@ -171,7 +175,7 @@ func (sess *session) Write(p []byte) (n int, err error) {
 	if sess.pty != nil {
 		m := len(p)
 		// normalize \n to \r\n when pty is accepted.
-		// this is a hardcoded shortcut since we don't support terminal modes.
+		// Terminal modes are exposed to applications but are not interpreted here.
 		p = bytes.ReplaceAll(p, []byte{'\n'}, []byte{'\r', '\n'})
 		p = bytes.ReplaceAll(p, []byte{'\r', '\r', '\n'}, []byte{'\r', '\n'})
 		n, err = sess.Channel.Write(p)
@@ -262,9 +266,14 @@ func (sess *session) Pty() (Pty, <-chan Window, bool) {
 	sess.Lock()
 	defer sess.Unlock()
 	if sess.pty != nil {
-		return *sess.pty, sess.winch, true
+		return clonePty(*sess.pty), sess.winch, true
 	}
 	return Pty{}, sess.winch, false
+}
+
+func clonePty(pty Pty) Pty {
+	pty.TerminalModes = maps.Clone(pty.TerminalModes)
+	return pty
 }
 
 func (sess *session) Signals(c chan<- Signal) {
@@ -623,7 +632,7 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 				continue
 			}
 			if sess.ptyCb != nil {
-				ok := sess.ptyCb(sess.ctx, ptyReq)
+				ok := sess.ptyCb(sess.ctx, clonePty(ptyReq))
 				if !ok {
 					_ = req.Reply(false, nil)
 					continue
@@ -641,6 +650,7 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 			win, ok := parseWinchRequest(req.Payload)
 			if ok {
 				sess.Lock()
+				win = mergeWindow(sess.pty.Window, win)
 				sess.pty.Window = win
 				select {
 				case sess.winch <- win:
@@ -675,6 +685,22 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 			_ = req.Reply(false, nil)
 		}
 	}
+}
+
+func mergeWindow(current, update Window) Window {
+	if update.Width != 0 {
+		current.Width = update.Width
+	}
+	if update.Height != 0 {
+		current.Height = update.Height
+	}
+	if update.WidthPixels != 0 {
+		current.WidthPixels = update.WidthPixels
+	}
+	if update.HeightPixels != 0 {
+		current.HeightPixels = update.HeightPixels
+	}
+	return current
 }
 
 func (sess *session) getLogger() log.Logger {
