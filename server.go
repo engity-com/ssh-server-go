@@ -93,6 +93,8 @@ type Server struct {
 	ConnCallback                  ConnCallback                  // optional callback for wrapping net.Conn before handling
 	LocalPortForwardingCallback   LocalPortForwardingCallback   // callback for allowing local port forwarding, denies all if nil
 	ReversePortForwardingCallback ReversePortForwardingCallback // callback for allowing reverse port forwarding, denies all if nil
+	LocalUnixForwardingCallback   LocalUnixForwardingCallback   // callback for local Unix forwarding, denies all if nil
+	ReverseUnixForwardingCallback ReverseUnixForwardingCallback // callback for reverse Unix forwarding, denies all if nil
 	ServerConfigCallback          ServerConfigCallback          // callback for detailed SSH options; same-method auth conflicts are rejected
 	SessionRequestCallback        SessionRequestCallback        // callback for allowing or denying SSH sessions
 	AgentForwardingCallback       AgentForwardingCallback       // callback for allowing agent forwarding, denies all if nil
@@ -164,6 +166,8 @@ type connectionSettings struct {
 	agentForwardingCallback       AgentForwardingCallback
 	localPortForwardingCallback   LocalPortForwardingCallback
 	reversePortForwardingCallback ReversePortForwardingCallback
+	localUnixForwardingCallback   LocalUnixForwardingCallback
+	reverseUnixForwardingCallback ReverseUnixForwardingCallback
 	channelHandlers               map[string]ChannelHandler
 	requestHandlers               map[string]RequestHandler
 	subsystemHandlers             map[string]SubsystemHandler
@@ -210,6 +214,8 @@ func (srv *Server) connectionSettings() *connectionSettings {
 		agentForwardingCallback:       srv.AgentForwardingCallback,
 		localPortForwardingCallback:   srv.LocalPortForwardingCallback,
 		reversePortForwardingCallback: srv.ReversePortForwardingCallback,
+		localUnixForwardingCallback:   srv.LocalUnixForwardingCallback,
+		reverseUnixForwardingCallback: srv.ReverseUnixForwardingCallback,
 		channelHandlers:               channelHandlers,
 		requestHandlers:               requestHandlers,
 		subsystemHandlers:             subsystemHandlers,
@@ -242,6 +248,8 @@ func (srv *Server) fallbackConnectionSettings() *connectionSettings {
 		agentForwardingCallback:       srv.AgentForwardingCallback,
 		localPortForwardingCallback:   srv.LocalPortForwardingCallback,
 		reversePortForwardingCallback: srv.ReversePortForwardingCallback,
+		localUnixForwardingCallback:   srv.LocalUnixForwardingCallback,
+		reverseUnixForwardingCallback: srv.ReverseUnixForwardingCallback,
 		subsystemHandlers:             maps.Clone(srv.SubsystemHandlers),
 		maxReverseForwards:            configuredLimit(srv.MaxReverseForwardsPerConnection, DefaultMaxReverseForwardsPerConnection),
 	}
@@ -946,6 +954,9 @@ func (srv *Server) handleConn(newConn net.Conn, active *activeConn, settings ...
 	}
 	channelLimiter := &connectionChannelLimiter{limit: int64(maxChannels), global: globalChannelLimiter}
 	ctx.SetValue(contextKeyChannelLimiter, channelLimiter)
+	var activeReverseForwards atomic.Int64
+	forwardLimiter := &resourceLimiter{limit: int64(connectionSettings.maxReverseForwards), active: &activeReverseForwards}
+	ctx.SetValue(contextKeyForwardLimiter, forwardLimiter)
 	workers := &connectionWorkers{}
 	ctx.SetValue(contextKeyConnectionWorkers, workers)
 	workers.goRun(func() {
@@ -1097,10 +1108,13 @@ func (srv *Server) handleRequests(ctx Context, in <-chan *gossh.Request, handler
 			}
 			continue
 		}
-		/*reqCtx, cancel := context.WithCancel(ctx)
-		defer cancel() */
+		reply := &requestReply{done: make(chan struct{})}
+		ctx.SetValue(contextKeyRequestReply, reply)
 		ret, payload := handler(ctx, srv, req)
-		if err := req.Reply(ret, payload); err != nil {
+		err := req.Reply(ret, payload)
+		reply.complete(err)
+		ctx.SetValue(contextKeyRequestReply, nil)
+		if err != nil {
 			return
 		}
 	}

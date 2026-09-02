@@ -99,6 +99,7 @@ jobs:
           - ssh-remoteforward
           - ssh-sftpserver
           - ssh-simple
+          - ssh-streamlocal
           - ssh-timeouts
     steps:
       - name: Checkout code
@@ -134,4 +135,3 @@ jobs:
 
       - name: Lint Go
         run: mise run lint:go
-
