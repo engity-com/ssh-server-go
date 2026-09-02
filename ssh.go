@@ -91,6 +91,12 @@ type ServerConfigCallback func(ctx Context, config *gossh.ServerConfig)
 // Please note: the net.Conn is likely to be closed at this point
 type ConnectionFailedCallback func(conn net.Conn, err error)
 
+// DisconnectCallback is called exactly once after a successfully established
+// SSH connection ends. The Context is canceled, the connection is closed, and
+// connection workers have stopped before the callback runs. Implementations must
+// return promptly. Panics from the callback are not recovered.
+type DisconnectCallback func(ctx Context, conn net.Conn)
+
 // Window represents the size of a PTY window.
 type Window struct {
 	Width  int
