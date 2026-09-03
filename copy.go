@@ -69,6 +69,10 @@ func FullDuplexCopy(ctx context.Context, left io.ReadWriteCloser, right io.ReadW
 		}
 	}()
 
+	closeStreams := sync.OnceFunc(func() {
+		closeQuietly(left)
+		closeQuietly(right)
+	})
 	copyFull := func(from io.Reader, to io.Writer, isL2r bool) {
 		if opts != nil {
 			if f := opts.OnStreamStart; f != nil {
@@ -88,6 +92,8 @@ func FullDuplexCopy(ctx context.Context, left io.ReadWriteCloser, right io.ReadW
 				if !isRelevantIoError(err) {
 					err = nil
 				}
+			} else {
+				closeStreams()
 			}
 		}
 
@@ -106,10 +112,6 @@ func FullDuplexCopy(ctx context.Context, left io.ReadWriteCloser, right io.ReadW
 	go copyFull(right, left, false)
 	go copyFull(left, right, true)
 
-	closeStreams := sync.OnceFunc(func() {
-		closeQuietly(left)
-		closeQuietly(right)
-	})
 	ctxDone := ctx.Done()
 	for completed := 0; completed < 2; {
 		select {
