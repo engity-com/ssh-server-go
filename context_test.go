@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	gossh "golang.org/x/crypto/ssh"
 )
 
 func TestSetPermissions(t *testing.T) {
@@ -14,14 +15,15 @@ func TestSetPermissions(t *testing.T) {
 		"foo": "bar",
 	}
 	session, _, cleanup := newTestSessionWithOptions(t, &Server{
-		Handler: func(s Session) {
+		Handler: func(s Session) error {
 			if _, ok := s.Permissions().Extensions["foo"]; !ok {
 				t.Fatalf("got %#v; want %#v", s.Permissions().Extensions, permsExt)
 			}
+			return nil
 		},
-	}, nil, PasswordAuth(func(ctx Context, password string) bool {
+	}, nil, PasswordAuth(func(ctx Context, _ gossh.ConnMetadata, password string) (bool, error) {
 		ctx.Permissions().Extensions = permsExt
-		return true
+		return true, nil
 	}))
 	defer cleanup()
 	if err := session.Run(""); err != nil {
@@ -48,15 +50,16 @@ func TestSetValue(t *testing.T) {
 	}
 	key := "testValue"
 	session, _, cleanup := newTestSessionWithOptions(t, &Server{
-		Handler: func(s Session) {
+		Handler: func(s Session) error {
 			v := s.Context().Value(key).(map[string]string)
 			if v["foo"] != value["foo"] {
 				t.Fatalf("got %#v; want %#v", v, value)
 			}
+			return nil
 		},
-	}, nil, PasswordAuth(func(ctx Context, password string) bool {
+	}, nil, PasswordAuth(func(ctx Context, _ gossh.ConnMetadata, password string) (bool, error) {
 		ctx.SetValue(key, value)
-		return true
+		return true, nil
 	}))
 	defer cleanup()
 	if err := session.Run(""); err != nil {

@@ -10,12 +10,12 @@ import (
 )
 
 func main() {
-	ssh.Handle(func(s ssh.Session) {
+	ssh.Handle(func(s ssh.Session) error {
 		cmd := exec.Command("ssh-add", "-l")
 		if ssh.AgentRequested(s) {
 			l, err := ssh.NewAgentListener()
 			if err != nil {
-				log.Fatal(err)
+				return fmt.Errorf("create agent listener: %w", err)
 			}
 			defer l.Close()
 			go ssh.ForwardAgentConnections(l, nil, s)
@@ -26,15 +26,15 @@ func main() {
 		cmd.Stdout = s
 		cmd.Stderr = s.Stderr()
 		if err := cmd.Run(); err != nil {
-			log.Println(err)
-			return
+			return fmt.Errorf("run ssh-add: %w", err)
 		}
+		return nil
 	})
 
 	server := &ssh.Server{
 		Addr: "127.0.0.1:2222",
-		AgentForwardingCallback: func(ssh.Context) bool {
-			return true
+		AgentForwardingCallback: func(ssh.Context, ssh.Session) (bool, error) {
+			return true, nil
 		},
 	}
 

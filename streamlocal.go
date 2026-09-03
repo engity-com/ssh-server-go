@@ -3,7 +3,7 @@ package ssh
 import (
 	"context"
 	"errors"
-	"net"
+	"fmt"
 	"sync"
 	"time"
 
@@ -23,67 +23,56 @@ type directStreamLocalChannelData struct {
 // DirectStreamLocalHandler handles client-to-server Unix socket forwarding. It
 // can be enabled under the direct-streamlocal@openssh.com channel type. The
 // configured LocalUnixForwardingCallback owns path authorization and dialing.
-func DirectStreamLocalHandler(srv *Server, sshConn *gossh.ServerConn, newChan gossh.NewChannel, ctx Context) {
+func DirectStreamLocalHandler(srv *Server, sshConn *gossh.ServerConn, newChan gossh.NewChannel, ctx Context) error {
 	if newChan == nil {
-		return
+		return nil
 	}
 	if srv == nil || sshConn == nil || ctx == nil {
 		_ = newChan.Reject(gossh.ConnectionFailed, "missing server connection context")
-		return
+		return nil
 	}
-	settings := serverSettingsFromContext(ctx, srv)
 	var data directStreamLocalChannelData
 	if err := gossh.Unmarshal(newChan.ExtraData(), &data); err != nil {
-		enrichLoggerForServerConnection(srv.logger(), sshConn).
-			WithError(err).
-			Warn("'direct-streamlocal@openssh.com': cannot parse channel data")
-		_ = newChan.Reject(gossh.ConnectionFailed, "invalid streamlocal channel data")
-		return
+		return locateError(ErrorScopeChannel, ErrorOperationParse, fmt.Errorf("parse direct-streamlocal channel data: %w", err))
 	}
-	if settings.localUnixForwardingCallback == nil {
+	if srv.LocalUnixForwardingCallback == nil {
 		_ = newChan.Reject(gossh.Prohibited, "unix forwarding is disabled")
-		return
+		return nil
 	}
 
-	conn, err := settings.localUnixForwardingCallback(ctx, data.SocketPath)
+	finishAcquisition, ok := beginConnectionResourceAcquisition(ctx)
+	if !ok {
+		_ = newChan.Reject(gossh.ConnectionFailed, "connection is closing")
+		return nil
+	}
+	conn, err := srv.LocalUnixForwardingCallback(ctx, sshConn, data.SocketPath)
 	if err != nil {
+		finishAcquisition(nil)
 		if errors.Is(err, ErrServerPermissionDenied) {
 			_ = newChan.Reject(gossh.Prohibited, "unix forwarding is denied")
-			return
+			return nil
 		}
-		logger := enrichLoggerForServerConnection(srv.logger(), sshConn).
-			With("streamlocal.path", data.SocketPath)
-		if err != nil {
-			logger = logger.WithError(err)
-		}
-		logger.Warn("'direct-streamlocal@openssh.com': failed to connect to destination")
-		_ = newChan.Reject(gossh.ConnectionFailed, "connection failed")
-		return
+		return locateError(ErrorScopeForwarding, ErrorOperationDial, fmt.Errorf("dial direct-streamlocal destination %q: %w", data.SocketPath, err))
 	}
 	if conn == nil {
-		enrichLoggerForServerConnection(srv.logger(), sshConn).
-			With("streamlocal.path", data.SocketPath).
-			Warn("'direct-streamlocal@openssh.com': callback returned no connection")
-		_ = newChan.Reject(gossh.ConnectionFailed, "connection failed")
-		return
+		finishAcquisition(nil)
+		return locateError(ErrorScopeForwarding, ErrorOperationDial, fmt.Errorf("dial direct-streamlocal destination %q: callback returned no connection", data.SocketPath))
 	}
-	unregisterConn := registerConnectionResource(ctx, func() { closeQuietly(conn) })
+	unregisterConn := finishAcquisition(func() { closeQuietly(conn) })
 	defer unregisterConn()
 
 	channel, reqs, err := newChan.Accept()
 	if err != nil {
 		closeQuietly(conn)
-		return
+		return locateError(ErrorScopeChannel, ErrorOperationAccept, fmt.Errorf("accept direct-streamlocal channel: %w", err))
 	}
 	go gossh.DiscardRequests(reqs)
 	defer closeQuietly(channel)
 	defer closeQuietly(conn)
 	if err := FullDuplexCopy(ctx, conn, channel, nil); err != nil {
-		enrichLoggerForServerConnection(srv.logger(), sshConn).
-			WithError(err).
-			With("streamlocal.path", data.SocketPath).
-			Warn("'direct-streamlocal@openssh.com': failed to forward connection")
+		return locateError(ErrorScopeForwarding, ErrorOperationForward, fmt.Errorf("forward direct-streamlocal connection: %w", err))
 	}
+	return nil
 }
 
 type remoteUnixForwardRequest struct {
@@ -106,72 +95,76 @@ type ForwardedUnixHandler struct {
 	sync.Mutex
 }
 
-func (h *ForwardedUnixHandler) HandleSSHRequest(ctx Context, srv *Server, req *gossh.Request) (bool, []byte) {
-	if h == nil || ctx == nil || srv == nil || req == nil {
-		return false, []byte("missing server connection context")
+func (h *ForwardedUnixHandler) HandleSSHRequest(response RequestResponseWriter, request *Request) error {
+	if h == nil || response == nil || request == nil {
+		return errors.New("ssh: missing streamlocal forwarding request handler state")
+	}
+	ctx := request.Context()
+	srv := request.Server()
+	if ctx == nil || srv == nil {
+		return response.Reject([]byte("missing server connection context"))
 	}
 	conn, ok := ctx.Value(ContextKeyConn).(*gossh.ServerConn)
 	if !ok || conn == nil {
-		return false, []byte("missing server connection context")
+		return response.Reject([]byte("missing server connection context"))
 	}
-	settings := serverSettingsFromContext(ctx, srv)
+	errorHandler := errorHandlerFromContext(ctx, srv)
 
-	switch req.Type {
+	switch request.Type {
 	case "streamlocal-forward@openssh.com":
 		var payload remoteUnixForwardRequest
-		if err := gossh.Unmarshal(req.Payload, &payload); err != nil {
-			h.loggerOfConnection(conn).WithError(err).
-				Warn("'streamlocal-forward@openssh.com': cannot parse request")
-			return false, nil
+		if err := gossh.Unmarshal(request.Payload, &payload); err != nil {
+			return locateError(ErrorScopeRequest, ErrorOperationParse, fmt.Errorf("parse streamlocal-forward request: %w", err))
 		}
-		if settings.reverseUnixForwardingCallback == nil {
-			return false, nil
+		if srv.ReverseUnixForwardingCallback == nil {
+			return response.Reject(nil)
 		}
 		key := forwardKey{conn: conn, addr: payload.SocketPath}
 		h.Lock()
 		_, duplicate := h.forwards[key]
 		h.Unlock()
 		if duplicate {
-			return false, nil
+			return response.Reject(nil)
 		}
 		forwardLimiter, _ := ctx.Value(contextKeyForwardLimiter).(*resourceLimiter)
 		if !forwardLimiter.reserve() {
-			return false, nil
+			return response.Reject(nil)
 		}
-		listener, err := settings.reverseUnixForwardingCallback(ctx, payload.SocketPath)
+		finishAcquisition, ok := beginConnectionResourceAcquisition(ctx)
+		if !ok {
+			forwardLimiter.release()
+			return response.Reject(nil)
+		}
+		listener, err := srv.ReverseUnixForwardingCallback(ctx, conn, payload.SocketPath)
 		if err != nil {
+			finishAcquisition(nil)
 			forwardLimiter.release()
 			if !errors.Is(err, ErrServerPermissionDenied) {
-				logger := h.loggerOfConnection(conn).With("streamlocal.path", payload.SocketPath)
-				if err != nil {
-					logger = logger.WithError(err)
-				}
-				logger.Warn("'streamlocal-forward@openssh.com': failed to create listener")
+				return locateError(ErrorScopeForwarding, ErrorOperationListen, fmt.Errorf("listen for streamlocal-forward on %q: %w", payload.SocketPath, err))
 			}
-			return false, nil
+			return response.Reject(nil)
 		}
 		if listener == nil {
+			finishAcquisition(nil)
 			forwardLimiter.release()
-			h.loggerOfConnection(conn).With("streamlocal.path", payload.SocketPath).
-				Warn("'streamlocal-forward@openssh.com': callback returned no listener")
-			return false, nil
+			return locateError(ErrorScopeForwarding, ErrorOperationListen, fmt.Errorf("listen for streamlocal-forward on %q: callback returned no listener", payload.SocketPath))
 		}
 
 		f := newForward(listener, forwardLimiter.release)
-		unregisterForward := registerConnectionResource(ctx, f.close)
+		unregisterForward := finishAcquisition(f.close)
 		h.Lock()
 		if h.forwards == nil {
 			h.forwards = make(map[forwardKey]*forward)
 		}
 		if _, duplicate = h.forwards[key]; duplicate {
 			h.Unlock()
+			unregisterForward()
 			f.close()
-			return false, nil
+			return response.Reject(nil)
 		}
 		h.forwards[key] = f
 		h.Unlock()
-		reply, _ := ctx.Value(contextKeyRequestReply).(*requestReply)
-
+		responseState := request.response
 		started := startConnectionWorker(ctx, func() {
 			defer unregisterForward()
 			stopCloseOnCancel := context.AfterFunc(ctx, f.close)
@@ -181,32 +174,24 @@ func (h *ForwardedUnixHandler) HandleSSHRequest(ctx Context, srv *Server, req *g
 				f.waitForPendingOpens()
 				h.removeForward(key, f)
 			}()
-			if reply != nil {
-				select {
-				case <-reply.done:
-					if reply.err != nil {
-						return
-					}
-				case <-ctx.Done():
-					return
-				}
+			accepted, responseErr := responseState.wait(ctx)
+			if responseErr != nil || !accepted {
+				return
 			}
-			h.forwardConnections(ctx, conn, payload.SocketPath, f)
+			h.forwardConnections(ctx, conn, payload.SocketPath, f, errorHandler)
 		})
 		if !started {
 			unregisterForward()
 			h.removeForward(key, f)
 			f.close()
-			return false, nil
+			return response.Reject(nil)
 		}
-		return true, nil
+		return response.Accept(nil)
 
 	case "cancel-streamlocal-forward@openssh.com":
 		var payload remoteUnixForwardRequest
-		if err := gossh.Unmarshal(req.Payload, &payload); err != nil {
-			h.loggerOfConnection(conn).WithError(err).
-				Warn("'cancel-streamlocal-forward@openssh.com': cannot parse request")
-			return false, nil
+		if err := gossh.Unmarshal(request.Payload, &payload); err != nil {
+			return locateError(ErrorScopeRequest, ErrorOperationParse, fmt.Errorf("parse cancel-streamlocal-forward request: %w", err))
 		}
 		key := forwardKey{conn: conn, addr: payload.SocketPath}
 		h.Lock()
@@ -214,16 +199,18 @@ func (h *ForwardedUnixHandler) HandleSSHRequest(ctx Context, srv *Server, req *g
 		h.Unlock()
 		if ok {
 			forward.close()
+			return response.Accept(nil)
 		}
-		return ok, nil
+		return response.Reject(nil)
 
 	default:
-		return false, nil
+		return response.Reject(nil)
 	}
 }
 
-func (h *ForwardedUnixHandler) forwardConnections(ctx Context, conn *gossh.ServerConn, socketPath string, f *forward) {
+func (h *ForwardedUnixHandler) forwardConnections(ctx Context, conn *gossh.ServerConn, socketPath string, f *forward, errorHandler ErrorHandler) {
 	limiter, _ := ctx.Value(contextKeyChannelLimiter).(*connectionChannelLimiter)
+	var acceptDelay time.Duration
 	for {
 		finishAcquisition, ok := beginConnectionResourceAcquisition(ctx)
 		if !ok {
@@ -233,13 +220,17 @@ func (h *ForwardedUnixHandler) forwardConnections(ctx Context, conn *gossh.Serve
 		if err != nil {
 			finishAcquisition(nil)
 			closeQuietly(accepted)
-			if !isClosedError(err) {
-				h.loggerOfConnection(conn).WithError(err).
-					With("streamlocal.path", socketPath).
-					Warn("'streamlocal-forward@openssh.com': listener stopped accepting")
+			if ctx.Err() == nil && !isClosedError(err) {
+				if dispatchErrorOrEscalate(ctx, h.loggerOfConnection(conn), errorHandler, ErrorScopeForwarding, ErrorOperationAccept, err, nil, defaultLogAndFailErrorAction) {
+					if !waitForRetry(ctx, &acceptDelay) {
+						return
+					}
+					continue
+				}
 			}
 			return
 		}
+		acceptDelay = 0
 		unregisterConn := finishAcquisition(func() { closeQuietly(accepted) })
 		if !limiter.reserve() {
 			unregisterConn()
@@ -259,25 +250,30 @@ func (h *ForwardedUnixHandler) forwardConnections(ctx Context, conn *gossh.Serve
 			defer limiter.release()
 			defer closeQuietly(accepted)
 			payload := gossh.Marshal(&remoteUnixForwardChannelData{SocketPath: socketPath})
-			channel, reqs, err := openForwardedUnixChannel(ctx, f.done, conn, payload)
-			f.endOpen()
+			var channel gossh.Channel
+			var reqs <-chan *gossh.Request
+			var err error
+			func() {
+				defer f.endOpen()
+				channel, reqs, err = openForwardedChannel(ctx, f.done, conn, forwardedUnixChannelType, payload)
+			}()
 			if err != nil {
 				select {
 				case <-f.done:
 					return
 				default:
 				}
-				h.loggerOfConnection(conn).WithError(err).
-					With("streamlocal.path", socketPath).
-					Warn("'streamlocal-forward@openssh.com': cannot open channel for accepted connection")
+				if !dispatchErrorOrEscalate(ctx, h.loggerOfConnection(conn), errorHandler, ErrorScopeForwarding, ErrorOperationOpenChannel, err, nil, defaultLogAndFailErrorAction) {
+					f.close()
+				}
 				return
 			}
 			defer closeQuietly(channel)
 			go gossh.DiscardRequests(reqs)
 			if err := FullDuplexCopy(ctx, accepted, channel, nil); err != nil {
-				h.loggerOfConnection(conn).WithError(err).
-					With("streamlocal.path", socketPath).
-					Warn("'streamlocal-forward@openssh.com': failed to forward connection")
+				if !dispatchErrorOrEscalate(ctx, h.loggerOfConnection(conn), errorHandler, ErrorScopeForwarding, ErrorOperationForward, err, nil, defaultLogAndFailErrorAction) {
+					f.close()
+				}
 			}
 		}) {
 			unregisterConn()
@@ -287,40 +283,6 @@ func (h *ForwardedUnixHandler) forwardConnections(ctx Context, conn *gossh.Serve
 			return
 		}
 	}
-}
-
-func openForwardedUnixChannel(ctx context.Context, forwardDone <-chan struct{}, conn *gossh.ServerConn, payload []byte) (gossh.Channel, <-chan *gossh.Request, error) {
-	// x/crypto/ssh registers ListenUnix after processing the success reply, so
-	// an immediately accepted connection can briefly race that registration.
-	for attempt := range 7 {
-		select {
-		case <-ctx.Done():
-			return nil, nil, context.Cause(ctx)
-		case <-forwardDone:
-			return nil, nil, net.ErrClosed
-		default:
-		}
-		channel, requests, err := conn.OpenChannel(forwardedUnixChannelType, payload)
-		if !isStreamLocalForwardRegistrationRace(err) || attempt == 6 {
-			return channel, requests, err
-		}
-		timer := time.NewTimer(time.Millisecond << attempt)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return nil, nil, context.Cause(ctx)
-		case <-forwardDone:
-			timer.Stop()
-			return nil, nil, net.ErrClosed
-		case <-timer.C:
-		}
-	}
-	panic("unreachable")
-}
-
-func isStreamLocalForwardRegistrationRace(err error) bool {
-	var openErr *gossh.OpenChannelError
-	return errors.As(err, &openErr) && openErr.Reason == gossh.Prohibited && openErr.Message == "no forward for address"
 }
 
 func (h *ForwardedUnixHandler) removeForward(key forwardKey, target *forward) {

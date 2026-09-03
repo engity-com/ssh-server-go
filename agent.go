@@ -120,7 +120,7 @@ func ForwardAgentConnections(ln net.Listener, logger log.Logger, sess Session) {
 		if !startConnectionWorker(ctx, func() {
 			defer closeQuietly(conn)
 			defer limiter.release()
-			channel, reqs, err := sshConn.OpenChannel(agentChannelType, nil)
+			channel, reqs, err := openForwardedChannel(ctx, nil, sshConn, agentChannelType, nil)
 			if err != nil {
 				logger.WithError(err).
 					Warnf("failed to open %s channel; rejecting...", agentChannelType)

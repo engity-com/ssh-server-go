@@ -12,16 +12,18 @@ handler is usually nil, which means to use DefaultHandler. Handle sets DefaultHa
 
 	ctx := context.Background()
 
-	ssh.Handle(func(s ssh.Session) {
-	    io.WriteString(s, "Hello world\n")
+	ssh.Handle(func(s ssh.Session) error {
+	    _, err := io.WriteString(s, "Hello world\n")
+	    return err
 	})
 
 	log.Fatal(ssh.ListenAndServe(ctx, ":2222", nil))
 
-If you don't specify a host key, it will generate one every time. This development
-convenience does not provide a stable server identity. Production servers should
-configure a persistent signer and set Server.RequireHostSigners. It's a better idea
-to generate or point to an existing key on your system:
+If you don't specify a host key, the Server generates one on first use and reuses
+it for its lifetime. This development convenience does not provide a stable
+identity across processes. Production servers should configure a persistent
+signer and set Server.RequireHostSigners. It's a better idea to generate or point
+to an existing key on your system:
 
 	log.Fatal(ssh.ListenAndServe(ctx, ":2222", nil, ssh.HostKeyFile("/Users/progrium/.ssh/id_rsa")))
 
@@ -36,6 +38,11 @@ server's behavior is by creating a custom Server:
 	s.AddHostKey(hostKeySigner)
 
 	log.Fatal(s.ListenAndServe(ctx))
+
+A Server is immutable after its first Serve or HandleConn call. Its fields and
+referenced configuration values must be fully configured before that point. An
+immutable Server may be reused concurrently. Runtime state and limits belong to
+each individual Serve or HandleConn call and are not aggregated across calls.
 
 This package handles basic SSH requests such as environment variables, PTYs,
 window changes, signals, and breaks. Relevant state and delivery hooks are

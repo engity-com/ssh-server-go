@@ -3,15 +3,15 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
 	"log"
 
 	"github.com/engity-com/ssh-server-go"
 )
 
 func main() {
-	ssh.Handle(func(s ssh.Session) {
-		io.WriteString(s, fmt.Sprintf("Hello %s\n", s.User()))
+	ssh.Handle(func(s ssh.Session) error {
+		_, err := fmt.Fprintf(s, "Hello %s\n", s.User())
+		return err
 	})
 
 	log.Println("DEVELOPMENT ONLY: anonymous authentication and an ephemeral host key")

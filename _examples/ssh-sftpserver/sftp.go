@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -11,7 +12,7 @@ import (
 )
 
 // SftpHandler handler for SFTP subsystem
-func SftpHandler(sess ssh.Session) {
+func SftpHandler(sess ssh.Session) error {
 	debugStream := io.Discard
 	serverOptions := []sftp.ServerOption{
 		sftp.WithDebug(debugStream),
@@ -21,15 +22,15 @@ func SftpHandler(sess ssh.Session) {
 		serverOptions...,
 	)
 	if err != nil {
-		log.Printf("sftp server init error: %s\n", err)
-		return
+		return fmt.Errorf("initialize sftp server: %w", err)
 	}
-	if err := server.Serve(); err == io.EOF {
-		server.Close()
+	serveErr := server.Serve()
+	closeErr := server.Close()
+	if errors.Is(serveErr, io.EOF) {
+		serveErr = nil
 		fmt.Println("sftp client exited session.")
-	} else if err != nil {
-		fmt.Println("sftp server completed with error:", err)
 	}
+	return errors.Join(serveErr, closeErr)
 }
 
 func main() {

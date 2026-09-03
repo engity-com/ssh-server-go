@@ -15,22 +15,6 @@ import (
 	gossh "golang.org/x/crypto/ssh"
 )
 
-func activeConnectionCount(srv *Server) int {
-	srv.mu.RLock()
-	scopes := make([]*serveScope, 0, len(srv.scopes))
-	for scope := range srv.scopes {
-		scopes = append(scopes, scope)
-	}
-	srv.mu.RUnlock()
-	result := 0
-	for _, scope := range scopes {
-		scope.mu.Lock()
-		result += len(scope.connections)
-		scope.mu.Unlock()
-	}
-	return result
-}
-
 func TestAddHostKey(t *testing.T) {
 	s := Server{}
 	signer, err := generateSigner()
@@ -53,18 +37,13 @@ func TestAddHostKey(t *testing.T) {
 
 func TestRequireHostSigners(t *testing.T) {
 	srv := &Server{RequireHostSigners: true}
-	require.ErrorIs(t, srv.ensureHostSigner(), ErrServerHostSignerRequired)
+	require.ErrorIs(t, srv.prepare(context.Background()), ErrServerHostSignerRequired)
+
+	srv = &Server{}
 	signer, err := generateSigner()
 	require.NoError(t, err)
 	srv.AddHostKey(signer)
-	require.NoError(t, srv.ensureHostSigner())
-
-	generated := &Server{}
-	require.NoError(t, generated.ensureHostSigner())
-	generated.RequireHostSigners = true
-	require.ErrorIs(t, generated.ensureHostSigner(), ErrServerHostSignerRequired)
-	generated.AddHostKey(signer)
-	require.NoError(t, generated.ensureHostSigner())
+	require.NoError(t, srv.prepare(context.Background()))
 }
 
 func TestHandleConnInitializesHostSigner(t *testing.T) {
@@ -96,9 +75,19 @@ func TestHandleConnInitializesHostSigner(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("HandleConn did not stop after the client closed")
 	}
-	srv.mu.RLock()
-	require.Len(t, srv.HostSigners, 1)
-	srv.mu.RUnlock()
+	require.Empty(t, srv.HostSigners)
+	require.Len(t, srv.generatedHostSigners, 1)
+}
+
+func TestPreparationDoesNotMutatePublicConfiguration(t *testing.T) {
+	srv := &Server{}
+	require.NoError(t, srv.prepare(context.Background()))
+	require.Nil(t, srv.Handler)
+	require.Nil(t, srv.HostSigners)
+	require.Nil(t, srv.ChannelHandlers)
+	require.Nil(t, srv.RequestHandlers)
+	require.Nil(t, srv.SubsystemHandlers)
+	require.Len(t, srv.generatedHostSigners, 1)
 }
 
 func TestDisconnectCallbackWaitsForConnectionWorkers(t *testing.T) {
@@ -118,13 +107,14 @@ func TestDisconnectCallbackWaitsForConnectionWorkers(t *testing.T) {
 	disconnected := make(chan observation, 1)
 	var calls atomic.Int32
 	srv := &Server{
-		Handler: func(session Session) {
+		Handler: func(session Session) error {
 			close(handlerStarted)
 			<-session.Context().Done()
 			close(handlerCanceled)
 			<-releaseHandler
+			return nil
 		},
-		DisconnectCallback: func(ctx Context, conn net.Conn) {
+		DisconnectCallback: func(ctx Context, conn net.Conn) error {
 			calls.Add(1)
 			_, connectionErr := conn.Write([]byte("closed"))
 			serverConn, _ := ctx.Value(ContextKeyConn).(*gossh.ServerConn)
@@ -135,6 +125,7 @@ func TestDisconnectCallbackWaitsForConnectionWorkers(t *testing.T) {
 				serverConn:    serverConn,
 				connectionErr: connectionErr,
 			}
+			return nil
 		},
 	}
 	session, client, cleanup := newTestSession(t, srv, nil)
@@ -166,8 +157,9 @@ func TestHandleConnReportsRequiredHostSigner(t *testing.T) {
 	var callbackCalls atomic.Int32
 	srv := &Server{
 		RequireHostSigners: true,
-		ConnectionFailedCallback: func(net.Conn, error) {
+		ConnectionFailedCallback: func(Context, net.Conn, error) error {
 			callbackCalls.Add(1)
+			return nil
 		},
 	}
 	serverConn, clientConn := net.Pipe()
@@ -178,11 +170,25 @@ func TestHandleConnReportsRequiredHostSigner(t *testing.T) {
 	_ = clientConn.SetReadDeadline(time.Now().Add(time.Second))
 	_, err = clientConn.Read(make([]byte, 1))
 	require.Error(t, err)
-	srv.mu.RLock()
-	require.Empty(t, srv.scopes)
-	require.Zero(t, srv.startups)
-	srv.mu.RUnlock()
 	require.Zero(t, callbackCalls.Load())
+}
+
+func TestHandleConnDispatchesHandshakeError(t *testing.T) {
+	var errorHandlerCalls atomic.Int32
+	srv := &Server{
+		ErrorHandler: func(ctx context.Context, scope ErrorScope, operation ErrorOperation, err error, respond ErrorResponder, next ErrorHandler) (bool, error) {
+			errorHandlerCalls.Add(1)
+			require.Equal(t, ErrorScopeConnection, scope)
+			require.Equal(t, ErrorOperationHandshake, operation)
+			return next(ctx, scope, operation, err, respond, next)
+		},
+	}
+	serverConn, clientConn := net.Pipe()
+	closeQuietly(clientConn)
+
+	err := srv.HandleConn(context.Background(), serverConn)
+	require.Error(t, err)
+	require.Equal(t, int32(1), errorHandlerCalls.Load())
 }
 
 func TestRequireClientAuthReportsMissingAuthentication(t *testing.T) {
@@ -207,12 +213,13 @@ func TestAuthCallbacksReceiveCurrentMetadata(t *testing.T) {
 	ctx, cancel := newContext(nil)
 	defer cancel()
 	var authUser, bannerUser string
-	srv := &Server{ServerConfigCallback: func(ctx Context, config *gossh.ServerConfig) {
+	srv := &Server{ServerConfigCallback: func(ctx Context, _ net.Conn, config *gossh.ServerConfig) error {
 		config.AuthLogCallback = func(gossh.ConnMetadata, string, error) { authUser = ctx.User() }
 		config.BannerCallback = func(gossh.ConnMetadata) string {
 			bannerUser = ctx.User()
 			return "banner"
 		}
+		return nil
 	}}
 	config := srv.config(ctx)
 	metadata := testConnMetadata{user: "current-user"}
@@ -232,7 +239,7 @@ func TestPreAuthCallbackReceivesCurrentContextMetadata(t *testing.T) {
 		remoteAddr    string
 	}
 	observed := make(chan metadata, 1)
-	srv := &Server{ServerConfigCallback: func(ctx Context, config *gossh.ServerConfig) {
+	srv := &Server{ServerConfigCallback: func(ctx Context, _ net.Conn, config *gossh.ServerConfig) error {
 		config.PreAuthConnCallback = func(gossh.ServerPreAuthConn) {
 			observed <- metadata{
 				user:          ctx.User(),
@@ -243,6 +250,7 @@ func TestPreAuthCallbackReceivesCurrentContextMetadata(t *testing.T) {
 				remoteAddr:    ctx.RemoteAddr().String(),
 			}
 		}
+		return nil
 	}}
 	session, _, cleanup := newTestSession(t, srv, nil)
 	defer cleanup()
@@ -262,15 +270,16 @@ func TestConflictingAuthenticationCallbacksAreRejected(t *testing.T) {
 	signer, err := generateSigner()
 	require.NoError(t, err)
 	srv := &Server{
-		PasswordHandler:            func(Context, string) bool { return true },
-		PublicKeyHandler:           func(Context, PublicKey) bool { return true },
-		KeyboardInteractiveHandler: func(Context, gossh.KeyboardInteractiveChallenge) bool { return true },
-		ServerConfigCallback: func(_ Context, config *gossh.ServerConfig) {
+		PasswordHandler:            func(Context, gossh.ConnMetadata, string) (bool, error) { return true, nil },
+		PublicKeyHandler:           func(Context, gossh.ConnMetadata, PublicKey) (bool, error) { return true, nil },
+		KeyboardInteractiveHandler: func(Context, gossh.ConnMetadata, gossh.KeyboardInteractiveChallenge) (bool, error) { return true, nil },
+		ServerConfigCallback: func(_ Context, _ net.Conn, config *gossh.ServerConfig) error {
 			config.PasswordCallback = func(gossh.ConnMetadata, []byte) (*gossh.Permissions, error) { return nil, nil }
 			config.PublicKeyCallback = func(gossh.ConnMetadata, gossh.PublicKey) (*gossh.Permissions, error) { return nil, nil }
 			config.KeyboardInteractiveCallback = func(gossh.ConnMetadata, gossh.KeyboardInteractiveChallenge) (*gossh.Permissions, error) {
 				return nil, nil
 			}
+			return nil
 		},
 	}
 	config := srv.config(ctx)
@@ -287,10 +296,10 @@ func TestConflictingPartialSuccessCallbacksAreRejected(t *testing.T) {
 	ctx, cancel := newContext(nil)
 	defer cancel()
 	srv := &Server{
-		PasswordHandler:            func(Context, string) bool { return true },
-		PublicKeyHandler:           func(Context, PublicKey) bool { return true },
-		KeyboardInteractiveHandler: func(Context, gossh.KeyboardInteractiveChallenge) bool { return true },
-		ServerConfigCallback: func(_ Context, config *gossh.ServerConfig) {
+		PasswordHandler:            func(Context, gossh.ConnMetadata, string) (bool, error) { return true, nil },
+		PublicKeyHandler:           func(Context, gossh.ConnMetadata, PublicKey) (bool, error) { return true, nil },
+		KeyboardInteractiveHandler: func(Context, gossh.ConnMetadata, gossh.KeyboardInteractiveChallenge) (bool, error) { return true, nil },
+		ServerConfigCallback: func(_ Context, _ net.Conn, config *gossh.ServerConfig) error {
 			config.GSSAPIWithMICConfig = &gossh.GSSAPIWithMICConfig{AllowLogin: func(gossh.ConnMetadata, string) (*gossh.Permissions, error) {
 				return nil, &gossh.PartialSuccessError{Next: gossh.ServerAuthCallbacks{
 					PasswordCallback: func(gossh.ConnMetadata, []byte) (*gossh.Permissions, error) {
@@ -304,6 +313,7 @@ func TestConflictingPartialSuccessCallbacksAreRejected(t *testing.T) {
 					},
 				}}
 			}}
+			return nil
 		},
 	}
 	config := srv.config(ctx)
@@ -316,86 +326,6 @@ func TestConflictingPartialSuccessCallbacksAreRejected(t *testing.T) {
 	require.ErrorIs(t, err, ErrServerAuthCallbackConflict)
 	_, err = partial.Next.KeyboardInteractiveCallback(testConnMetadata{user: "user"}, nil)
 	require.ErrorIs(t, err, ErrServerAuthCallbackConflict)
-}
-
-func TestConnectionSettingsSnapshot(t *testing.T) {
-	timeout := time.Second
-	oldHandlerCalled := false
-	oldChannelHandlerCalled := false
-	oldDisconnectCallbackCalled := false
-	srv := &Server{
-		Handler:            func(Session) { oldHandlerCalled = true },
-		DisconnectCallback: func(Context, net.Conn) { oldDisconnectCallbackCalled = true },
-		ChannelHandlers: map[string]ChannelHandler{
-			"test": func(*Server, *gossh.ServerConn, gossh.NewChannel, Context) {
-				oldChannelHandlerCalled = true
-			},
-		},
-		HandshakeTimeout: &timeout,
-	}
-
-	settings := srv.connectionSettings()
-	srv.Handle(func(Session) { t.Fatal("snapshot used updated handler") })
-	srv.DisconnectCallback = func(Context, net.Conn) { t.Fatal("snapshot used updated disconnect callback") }
-	srv.ChannelHandlers["test"] = func(*Server, *gossh.ServerConn, gossh.NewChannel, Context) {
-		t.Fatal("snapshot used updated channel handler")
-	}
-	timeout = 2 * time.Second
-
-	settings.handler(nil)
-	settings.disconnectCallback(nil, nil)
-	settings.channelHandlers["test"](nil, nil, nil, nil)
-	require.True(t, oldHandlerCalled)
-	require.True(t, oldDisconnectCallbackCalled)
-	require.True(t, oldChannelHandlerCalled)
-	require.Equal(t, time.Second, settings.handshakeTimeout)
-}
-
-func TestSetOptionRejectsRunningServer(t *testing.T) {
-	srv := &Server{scopes: map[*serveScope]struct{}{{}: {}}}
-	called := false
-	option := func(*Server) error {
-		called = true
-		return nil
-	}
-
-	require.ErrorIs(t, srv.SetOption(option), ErrServerRunning)
-	require.False(t, called)
-	srv.scopes = nil
-	require.NoError(t, srv.SetOption(option))
-	require.True(t, called)
-}
-
-func TestHandleConnIsRejectedDuringOptionUpdate(t *testing.T) {
-	optionEntered := make(chan struct{})
-	releaseOption := make(chan struct{})
-	srv := &Server{}
-	optionDone := make(chan error, 1)
-	go func() {
-		optionDone <- srv.SetOption(func(*Server) error {
-			close(optionEntered)
-			<-releaseOption
-			return nil
-		})
-	}()
-	<-optionEntered
-	serverConn, clientConn := net.Pipe()
-	defer closeQuietly(clientConn)
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		_ = srv.HandleConn(context.Background(), serverConn)
-	}()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("HandleConn waited untracked for an option update")
-	}
-	_ = clientConn.SetReadDeadline(time.Now().Add(time.Second))
-	_, err := clientConn.Read(make([]byte, 1))
-	require.Error(t, err)
-	close(releaseOption)
-	require.NoError(t, <-optionDone)
 }
 
 func TestServerConfigUsesAlgorithmDefaults(t *testing.T) {
@@ -415,12 +345,13 @@ func TestServerConfigUsesConfiguredAlgorithms(t *testing.T) {
 		Ciphers:                Ciphers{CipherChacha20Poly1305},
 		KeyExchanges:           KeyExchanges{KeyExchangeMlkem768x25519xSha256},
 		MessageAuthentications: MessageAuthentications{MessageAuthenticationHmacSha2B512Etm},
-		ServerConfigCallback: func(_ Context, config *gossh.ServerConfig) {
+		ServerConfigCallback: func(_ Context, _ net.Conn, config *gossh.ServerConfig) error {
 			config.Config = gossh.Config{
 				Ciphers:      []string{CipherAes128Ctr.String()},
 				KeyExchanges: []string{KeyExchangeEcdh256.String()},
 				MACs:         []string{MessageAuthenticationHmacSha2B256.String()},
 			}
+			return nil
 		},
 	}
 
@@ -439,8 +370,9 @@ func TestServerConfigPreservesCallbackAlgorithms(t *testing.T) {
 		MACs:         []string{MessageAuthenticationHmacSha2B256.String()},
 	}
 	srv := &Server{
-		ServerConfigCallback: func(_ Context, config *gossh.ServerConfig) {
+		ServerConfigCallback: func(_ Context, _ net.Conn, config *gossh.ServerConfig) error {
 			config.Config = expected
+			return nil
 		},
 	}
 
@@ -452,8 +384,9 @@ func TestServerConfigPreservesCallbackAlgorithms(t *testing.T) {
 
 func TestServerConfigCallbackReceivesFreshConfig(t *testing.T) {
 	var configs []*gossh.ServerConfig
-	srv := &Server{ServerConfigCallback: func(_ Context, config *gossh.ServerConfig) {
+	srv := &Server{ServerConfigCallback: func(_ Context, _ net.Conn, config *gossh.ServerConfig) error {
 		configs = append(configs, config)
+		return nil
 	}}
 	ctx1, cancel1 := newContext(nil)
 	defer cancel1()
@@ -468,33 +401,15 @@ func TestServerConfigCallbackReceivesFreshConfig(t *testing.T) {
 	require.NotSame(t, first, second)
 }
 
-func TestServerConfigCallbackRunsWithoutServerLock(t *testing.T) {
-	srv := &Server{}
-	srv.ServerConfigCallback = func(Context, *gossh.ServerConfig) {
-		srv.Handle(func(Session) {})
-	}
-	ctx, cancel := newContext(nil)
-	defer cancel()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		srv.config(ctx)
-	}()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("ServerConfigCallback ran while the server lock was held")
-	}
-}
-
 func TestServerConfigCallbackDoesNotEnableNoClientAuth(t *testing.T) {
 	ctx, cancel := newContext(nil)
 	defer cancel()
 	srv := &Server{
-		ServerConfigCallback: func(_ Context, config *gossh.ServerConfig) {
+		ServerConfigCallback: func(_ Context, _ net.Conn, config *gossh.ServerConfig) error {
 			config.PasswordCallback = func(gossh.ConnMetadata, []byte) (*gossh.Permissions, error) {
 				return nil, nil
 			}
+			return nil
 		},
 	}
 
@@ -504,8 +419,9 @@ func TestServerConfigCallbackDoesNotEnableNoClientAuth(t *testing.T) {
 func TestServerConfigCallbackPreservesAnonymousZeroValue(t *testing.T) {
 	ctx, cancel := newContext(nil)
 	defer cancel()
-	srv := &Server{ServerConfigCallback: func(_ Context, config *gossh.ServerConfig) {
+	srv := &Server{ServerConfigCallback: func(_ Context, _ net.Conn, config *gossh.ServerConfig) error {
 		config.MaxAuthTries = 3
+		return nil
 	}}
 
 	require.True(t, srv.config(ctx).NoClientAuth)
@@ -515,10 +431,11 @@ func TestCustomAuthenticationCallbackPublishesFinalState(t *testing.T) {
 	ctx, cancel := newContext(nil)
 	defer cancel()
 	srv := &Server{
-		ServerConfigCallback: func(_ Context, config *gossh.ServerConfig) {
+		ServerConfigCallback: func(_ Context, _ net.Conn, config *gossh.ServerConfig) error {
 			config.PasswordCallback = func(gossh.ConnMetadata, []byte) (*gossh.Permissions, error) {
 				return &gossh.Permissions{Extensions: map[string]string{"method": "custom"}}, nil
 			}
+			return nil
 		},
 	}
 	config := srv.config(ctx)
@@ -536,7 +453,7 @@ func TestPartialAuthenticationCallbacksIsolateAttemptState(t *testing.T) {
 	var secondFactorUser string
 	var secondFactorPermissions map[string]string
 	srv := &Server{
-		ServerConfigCallback: func(_ Context, config *gossh.ServerConfig) {
+		ServerConfigCallback: func(_ Context, _ net.Conn, config *gossh.ServerConfig) error {
 			config.PasswordCallback = func(gossh.ConnMetadata, []byte) (*gossh.Permissions, error) {
 				return nil, &gossh.PartialSuccessError{
 					Next: gossh.ServerAuthCallbacks{
@@ -548,6 +465,7 @@ func TestPartialAuthenticationCallbacksIsolateAttemptState(t *testing.T) {
 					},
 				}
 			}
+			return nil
 		},
 	}
 	config := srv.config(ctx)
@@ -568,13 +486,14 @@ func TestGSSAPIAuthenticationInitializesContext(t *testing.T) {
 	defer cancel()
 	var callbackUser string
 	srv := &Server{
-		ServerConfigCallback: func(_ Context, config *gossh.ServerConfig) {
+		ServerConfigCallback: func(_ Context, _ net.Conn, config *gossh.ServerConfig) error {
 			config.GSSAPIWithMICConfig = &gossh.GSSAPIWithMICConfig{
 				AllowLogin: func(gossh.ConnMetadata, string) (*gossh.Permissions, error) {
 					callbackUser = ctx.User()
 					return nil, nil
 				},
 			}
+			return nil
 		},
 	}
 	config := srv.config(ctx)
@@ -589,10 +508,10 @@ func TestAuthenticationCallbacksIsolateAttemptState(t *testing.T) {
 	defer cancel()
 	var users []string
 	srv := &Server{
-		PasswordHandler: func(ctx Context, _ string) bool {
+		PasswordHandler: func(ctx Context, _ gossh.ConnMetadata, _ string) (bool, error) {
 			users = append(users, ctx.User())
 			ctx.Permissions().Extensions = map[string]string{"user": ctx.User()}
-			return ctx.User() == "admin"
+			return ctx.User() == "admin", nil
 		},
 	}
 	config := srv.config(ctx)
@@ -613,9 +532,9 @@ func TestPublicKeyStateIsPublishedOnlyAfterVerification(t *testing.T) {
 	require.NoError(t, err)
 	key := signer.PublicKey()
 	srv := &Server{
-		PublicKeyHandler: func(ctx Context, _ PublicKey) bool {
+		PublicKeyHandler: func(ctx Context, _ gossh.ConnMetadata, _ PublicKey) (bool, error) {
 			ctx.Permissions().Extensions = map[string]string{"method": "public-key"}
-			return true
+			return true, nil
 		},
 	}
 	config := srv.config(ctx)
@@ -637,10 +556,11 @@ func TestCustomPublicKeyCallbackPublishesVerifiedKey(t *testing.T) {
 	signer, err := generateSigner()
 	require.NoError(t, err)
 	key := signer.PublicKey()
-	srv := &Server{ServerConfigCallback: func(_ Context, config *gossh.ServerConfig) {
+	srv := &Server{ServerConfigCallback: func(_ Context, _ net.Conn, config *gossh.ServerConfig) error {
 		config.PublicKeyCallback = func(gossh.ConnMetadata, gossh.PublicKey) (*gossh.Permissions, error) {
 			return &gossh.Permissions{}, nil
 		}
+		return nil
 	}}
 	config := srv.config(ctx)
 	metadata := testConnMetadata{user: "user"}
@@ -664,13 +584,14 @@ func TestCustomVerifiedPublicKeyCallbackPublishesReturnedPermissions(t *testing.
 		Extensions:      map[string]string{"role": "admin"},
 		ExtraData:       map[any]any{"audit": "verified"},
 	}
-	srv := &Server{ServerConfigCallback: func(_ Context, config *gossh.ServerConfig) {
+	srv := &Server{ServerConfigCallback: func(_ Context, _ net.Conn, config *gossh.ServerConfig) error {
 		config.PublicKeyCallback = func(gossh.ConnMetadata, gossh.PublicKey) (*gossh.Permissions, error) {
 			return &gossh.Permissions{}, nil
 		}
 		config.VerifiedPublicKeyCallback = func(gossh.ConnMetadata, gossh.PublicKey, *gossh.Permissions, string) (*gossh.Permissions, error) {
 			return replacement, nil
 		}
+		return nil
 	}}
 	config := srv.config(ctx)
 	metadata := testConnMetadata{user: "user"}
@@ -688,7 +609,7 @@ func TestPublicKeyPartialSuccessPreservesVerifiedKey(t *testing.T) {
 	signer, err := generateSigner()
 	require.NoError(t, err)
 	key := signer.PublicKey()
-	srv := &Server{ServerConfigCallback: func(_ Context, config *gossh.ServerConfig) {
+	srv := &Server{ServerConfigCallback: func(_ Context, _ net.Conn, config *gossh.ServerConfig) error {
 		config.PublicKeyCallback = func(gossh.ConnMetadata, gossh.PublicKey) (*gossh.Permissions, error) {
 			return &gossh.Permissions{}, nil
 		}
@@ -699,6 +620,7 @@ func TestPublicKeyPartialSuccessPreservesVerifiedKey(t *testing.T) {
 				},
 			}}
 		}
+		return nil
 	}}
 	config := srv.config(ctx)
 	metadata := testConnMetadata{user: "user"}
@@ -720,13 +642,14 @@ func TestPublicKeyVerificationFailureDoesNotPublishKey(t *testing.T) {
 	defer cancel()
 	signer, err := generateSigner()
 	require.NoError(t, err)
-	srv := &Server{ServerConfigCallback: func(_ Context, config *gossh.ServerConfig) {
+	srv := &Server{ServerConfigCallback: func(_ Context, _ net.Conn, config *gossh.ServerConfig) error {
 		config.PublicKeyCallback = func(gossh.ConnMetadata, gossh.PublicKey) (*gossh.Permissions, error) {
 			return &gossh.Permissions{}, nil
 		}
 		config.VerifiedPublicKeyCallback = func(gossh.ConnMetadata, gossh.PublicKey, *gossh.Permissions, string) (*gossh.Permissions, error) {
 			return nil, ErrServerPermissionDenied
 		}
+		return nil
 	}}
 	config := srv.config(ctx)
 	metadata := testConnMetadata{user: "user"}
@@ -745,7 +668,7 @@ func TestVerifiedPublicKeyCallbackPreservesNilPermissions(t *testing.T) {
 			defer cancel()
 			signer, err := generateSigner()
 			require.NoError(t, err)
-			srv := &Server{ServerConfigCallback: func(_ Context, config *gossh.ServerConfig) {
+			srv := &Server{ServerConfigCallback: func(_ Context, _ net.Conn, config *gossh.ServerConfig) error {
 				config.VerifiedPublicKeyCallback = func(gossh.ConnMetadata, gossh.PublicKey, *gossh.Permissions, string) (*gossh.Permissions, error) {
 					return nil, nil
 				}
@@ -754,9 +677,10 @@ func TestVerifiedPublicKeyCallbackPreservesNilPermissions(t *testing.T) {
 						return &gossh.Permissions{}, nil
 					}
 				}
+				return nil
 			}}
 			if withPublicKeyHandler {
-				srv.PublicKeyHandler = func(Context, PublicKey) bool { return true }
+				srv.PublicKeyHandler = func(Context, gossh.ConnMetadata, PublicKey) (bool, error) { return true, nil }
 			}
 			config := srv.config(ctx)
 			metadata := testConnMetadata{user: "user"}
@@ -776,11 +700,12 @@ func TestRejectedVerifiedKeyDoesNotLeakIntoPasswordAuthentication(t *testing.T) 
 	signer, err := generateSigner()
 	require.NoError(t, err)
 	srv := &Server{
-		PasswordHandler: func(Context, string) bool { return true },
-		ServerConfigCallback: func(_ Context, config *gossh.ServerConfig) {
+		PasswordHandler: func(Context, gossh.ConnMetadata, string) (bool, error) { return true, nil },
+		ServerConfigCallback: func(_ Context, _ net.Conn, config *gossh.ServerConfig) error {
 			config.PublicKeyCallback = func(gossh.ConnMetadata, gossh.PublicKey) (*gossh.Permissions, error) {
 				return &gossh.Permissions{}, nil
 			}
+			return nil
 		},
 	}
 	config := srv.config(ctx)
@@ -803,9 +728,9 @@ func TestRejectedVerifiedKeyDoesNotReachPasswordSession(t *testing.T) {
 	require.NoError(t, err)
 	publicKeySeen := make(chan bool, 1)
 	srv := &Server{
-		Handler:         func(s Session) { publicKeySeen <- s.PublicKey() != nil },
-		PasswordHandler: func(Context, string) bool { return true },
-		ServerConfigCallback: func(_ Context, config *gossh.ServerConfig) {
+		Handler:         func(s Session) error { publicKeySeen <- s.PublicKey() != nil; return nil },
+		PasswordHandler: func(Context, gossh.ConnMetadata, string) (bool, error) { return true, nil },
+		ServerConfigCallback: func(_ Context, _ net.Conn, config *gossh.ServerConfig) error {
 			config.PublicKeyCallback = func(gossh.ConnMetadata, gossh.PublicKey) (*gossh.Permissions, error) {
 				return &gossh.Permissions{}, nil
 			}
@@ -814,6 +739,7 @@ func TestRejectedVerifiedKeyDoesNotReachPasswordSession(t *testing.T) {
 					"source-address": "192.0.2.1",
 				}}, nil
 			}
+			return nil
 		},
 	}
 	session, _, cleanup := newTestSession(t, srv, &gossh.ClientConfig{
@@ -830,8 +756,8 @@ func TestPartialSuccessNextPublicKeyReachesSession(t *testing.T) {
 	require.NoError(t, err)
 	publicKeySeen := make(chan PublicKey, 1)
 	srv := &Server{
-		Handler: func(s Session) { publicKeySeen <- s.PublicKey() },
-		ServerConfigCallback: func(_ Context, config *gossh.ServerConfig) {
+		Handler: func(s Session) error { publicKeySeen <- s.PublicKey(); return nil },
+		ServerConfigCallback: func(_ Context, _ net.Conn, config *gossh.ServerConfig) error {
 			config.PasswordCallback = func(gossh.ConnMetadata, []byte) (*gossh.Permissions, error) {
 				return nil, &gossh.PartialSuccessError{Next: gossh.ServerAuthCallbacks{
 					PublicKeyCallback: func(gossh.ConnMetadata, gossh.PublicKey) (*gossh.Permissions, error) {
@@ -839,6 +765,7 @@ func TestPartialSuccessNextPublicKeyReachesSession(t *testing.T) {
 					},
 				}}
 			}
+			return nil
 		},
 	}
 	session, _, cleanup := newTestSession(t, srv, &gossh.ClientConfig{
@@ -925,9 +852,9 @@ func TestTimeoutCancelsBlockingConnCallback(t *testing.T) {
 		t.Run(field, func(t *testing.T) {
 			timeout := 10 * time.Millisecond
 			disabled := time.Duration(0)
-			srv := &Server{ConnCallback: func(ctx Context, _ net.Conn) net.Conn {
+			srv := &Server{ConnCallback: func(ctx Context, _ net.Conn) (net.Conn, error) {
 				<-ctx.Done()
-				return nil
+				return nil, nil
 			}}
 			if field == "handshake" {
 				srv.HandshakeTimeout = &timeout
@@ -957,10 +884,10 @@ func TestHandleConnContextCancelsConnCallback(t *testing.T) {
 	callbackEntered := make(chan struct{})
 	srv := &Server{
 		HandshakeTimeout: &disabled,
-		ConnCallback: func(ctx Context, _ net.Conn) net.Conn {
+		ConnCallback: func(ctx Context, _ net.Conn) (net.Conn, error) {
 			close(callbackEntered)
 			<-ctx.Done()
-			return nil
+			return nil, nil
 		},
 	}
 	serverConn, clientConn := net.Pipe()
@@ -1033,9 +960,31 @@ func TestConnectionChannelLimiterUsesGlobalLimit(t *testing.T) {
 	second.release()
 }
 
+func TestResourceLimiterUsesParentLimit(t *testing.T) {
+	var globalActive, firstActive, secondActive atomic.Int64
+	global := &resourceLimiter{limit: 1, active: &globalActive}
+	first := &resourceLimiter{limit: 10, active: &firstActive, parent: global}
+	second := &resourceLimiter{limit: 10, active: &secondActive, parent: global}
+
+	require.True(t, first.reserve())
+	require.False(t, second.reserve())
+	require.Zero(t, secondActive.Load())
+	first.release()
+	require.True(t, second.reserve())
+	second.release()
+	require.Zero(t, globalActive.Load())
+}
+
 func TestMaxStartupsRejectsConnectionsAtFullLimit(t *testing.T) {
 	l := newLocalListener()
-	s := &Server{MaxStartups: &MaxStartupsConfig{Start: 1, Rate: 0, Full: 1}}
+	firstEntered := make(chan struct{})
+	s := &Server{
+		MaxStartups: &MaxStartupsConfig{Start: 1, Rate: 0, Full: 1},
+		ConnCallback: func(_ Context, conn net.Conn) (net.Conn, error) {
+			close(firstEntered)
+			return conn, nil
+		},
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- s.Serve(ctx, l) }()
@@ -1043,11 +992,7 @@ func TestMaxStartupsRejectsConnectionsAtFullLimit(t *testing.T) {
 	first, err := net.Dial("tcp", l.Addr().String())
 	require.NoError(t, err)
 	defer closeQuietly(first)
-	require.Eventually(t, func() bool {
-		s.mu.RLock()
-		defer s.mu.RUnlock()
-		return s.startups == 1
-	}, time.Second, time.Millisecond)
+	<-firstEntered
 
 	second, err := net.Dial("tcp", l.Addr().String())
 	require.NoError(t, err)
@@ -1073,11 +1018,12 @@ func TestDisconnectCallbackRunsForAuthenticatedConnectionLimitRejection(t *testi
 	disconnected := make(chan observation, 2)
 	s := &Server{
 		MaxConnections: &maxConnections,
-		DisconnectCallback: func(ctx Context, _ net.Conn) {
+		DisconnectCallback: func(ctx Context, _ net.Conn) error {
 			disconnected <- observation{
 				user:          ctx.User(),
 				hasServerConn: ctx.Value(ContextKeyConn) != nil,
 			}
+			return nil
 		},
 	}
 	l := newLocalListener()
@@ -1106,9 +1052,6 @@ func TestDisconnectCallbackRunsForAuthenticatedConnectionLimitRejection(t *testi
 	first, err := gossh.Dial("tcp", l.Addr().String(), clientConfig("first"))
 	require.NoError(t, err)
 	clients = append(clients, first)
-	require.Eventually(t, func() bool {
-		return s.authenticatedConnections.Load() == 1
-	}, time.Second, time.Millisecond)
 
 	second, _ := gossh.Dial("tcp", l.Addr().String(), clientConfig("second"))
 	if second != nil {
@@ -1133,21 +1076,24 @@ func TestDisconnectCallbackRunsForAuthenticatedConnectionLimitRejection(t *testi
 	}
 }
 
-func TestFailedHandshakeReleasesStartupBeforeCallback(t *testing.T) {
+func TestFailedHandshakeRetainsStartupDuringCallback(t *testing.T) {
 	l := newLocalListener()
 	callbackEntered := make(chan struct{})
+	callbackDone := make(chan struct{})
 	releaseCallback := make(chan struct{})
 	var callbackOnce sync.Once
 	var disconnectCalls atomic.Int32
 	s := &Server{
 		MaxStartups: &MaxStartupsConfig{Start: 1, Full: 1},
-		ConnectionFailedCallback: func(net.Conn, error) {
+		ConnectionFailedCallback: func(Context, net.Conn, error) error {
 			callbackOnce.Do(func() {
 				close(callbackEntered)
 				<-releaseCallback
+				close(callbackDone)
 			})
+			return nil
 		},
-		DisconnectCallback: func(Context, net.Conn) { disconnectCalls.Add(1) },
+		DisconnectCallback: func(Context, net.Conn) error { disconnectCalls.Add(1); return nil },
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	serveDone := make(chan error, 1)
@@ -1171,17 +1117,41 @@ func TestFailedHandshakeReleasesStartupBeforeCallback(t *testing.T) {
 	require.NoError(t, second.SetReadDeadline(time.Now().Add(time.Second)))
 	version := make([]byte, 4)
 	_, err = io.ReadFull(second, version)
-	require.NoError(t, err)
-	require.Equal(t, "SSH-", string(version))
+	require.Error(t, err)
 
 	close(releaseCallback)
+	<-callbackDone
+	var third net.Conn
+	require.Eventually(t, func() bool {
+		candidate, dialErr := net.Dial("tcp", l.Addr().String())
+		if dialErr != nil {
+			return false
+		}
+		if deadlineErr := candidate.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); deadlineErr != nil {
+			closeQuietly(candidate)
+			return false
+		}
+		if _, readErr := io.ReadFull(candidate, version); readErr != nil {
+			closeQuietly(candidate)
+			return false
+		}
+		third = candidate
+		return true
+	}, time.Second, time.Millisecond)
+	defer closeQuietly(third)
+	require.Equal(t, "SSH-", string(version))
+
 	cancel()
 	require.ErrorIs(t, <-serveDone, context.Canceled)
 }
 
 func TestServeContextClosesConnectionDuringHandshake(t *testing.T) {
 	l := newLocalListener()
-	s := &Server{}
+	callbackEntered := make(chan struct{})
+	s := &Server{ConnCallback: func(_ Context, conn net.Conn) (net.Conn, error) {
+		close(callbackEntered)
+		return conn, nil
+	}}
 	ctx, cancel := context.WithCancel(context.Background())
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- s.Serve(ctx, l) }()
@@ -1190,9 +1160,7 @@ func TestServeContextClosesConnectionDuringHandshake(t *testing.T) {
 	require.NoError(t, err)
 	defer closeQuietly(conn)
 
-	require.Eventually(t, func() bool {
-		return activeConnectionCount(s) == 1
-	}, time.Second, time.Millisecond)
+	<-callbackEntered
 	cancel()
 	require.NoError(t, conn.SetReadDeadline(time.Now().Add(time.Second)))
 	_, err = io.ReadAll(conn)
@@ -1212,10 +1180,10 @@ func TestHandleConnContextRejectsConnCallbackReplacement(t *testing.T) {
 	callbackEntered := make(chan struct{})
 	releaseCallback := make(chan struct{})
 	s := &Server{
-		ConnCallback: func(Context, net.Conn) net.Conn {
+		ConnCallback: func(Context, net.Conn) (net.Conn, error) {
 			close(callbackEntered)
 			<-releaseCallback
-			return replacement
+			return replacement, nil
 		},
 	}
 	ctx, cancel := context.WithCancel(context.Background())

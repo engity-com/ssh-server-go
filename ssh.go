@@ -42,52 +42,75 @@ func getDefaultHandler() Handler {
 // Option is a functional option handler for Server.
 type Option func(*Server) error
 
-// Handler is a callback for handling established SSH sessions.
-type Handler func(Session)
+// Handler is a callback for handling established SSH sessions. A returned error
+// is passed to ErrorHandler. Unless it is handled with canContinue set to true,
+// the server attempts to end the session with exit status 1. An explicit prior
+// call to Session.Exit takes precedence, and closing the connection from the
+// ErrorResponder can prevent delivery of an automatic exit status. A returned
+// SessionExitError requests a controlled message and exit status without
+// invoking ErrorHandler when both can be delivered successfully.
+type Handler func(Session) error
 
-// BannerHandler is a callback for displaying the server banner.
-type BannerHandler func(ctx Context) string
+// BannerHandler resolves the server banner for a connection. A returned error
+// aborts the SSH handshake.
+type BannerHandler func(ctx Context, conn gossh.ConnMetadata) (string, error)
 
 // PublicKeyHandler is a callback for performing public key authentication.
-type PublicKeyHandler func(ctx Context, key PublicKey) bool
+// Returning false, nil denies the authentication attempt. A non-nil error
+// aborts the SSH handshake.
+type PublicKeyHandler func(ctx Context, conn gossh.ConnMetadata, key PublicKey) (bool, error)
 
 // PasswordHandler is a callback for performing password authentication.
-type PasswordHandler func(ctx Context, password string) bool
+// Returning false, nil denies the authentication attempt. A non-nil error
+// aborts the SSH handshake.
+type PasswordHandler func(ctx Context, conn gossh.ConnMetadata, password string) (bool, error)
 
-// KeyboardInteractiveHandler is a callback for performing keyboard-interactive authentication.
-type KeyboardInteractiveHandler func(ctx Context, challenger gossh.KeyboardInteractiveChallenge) bool
+// KeyboardInteractiveHandler is a callback for performing keyboard-interactive
+// authentication. Returning false, nil denies the authentication attempt. A
+// non-nil error aborts the SSH handshake.
+type KeyboardInteractiveHandler func(ctx Context, conn gossh.ConnMetadata, challenger gossh.KeyboardInteractiveChallenge) (bool, error)
 
 // PtyCallback is a hook for allowing PTY sessions. The Pty contains the
 // client's requested metadata; this package does not allocate or configure an
-// operating-system PTY.
-type PtyCallback func(ctx Context, pty Pty) bool
+// operating-system PTY. Returning false, nil denies the request. A non-nil
+// error is passed to ErrorHandler and ends the session by default.
+type PtyCallback func(ctx Context, sess Session, pty Pty) (bool, error)
 
 // SessionRequestCallback is a callback for allowing or denying SSH sessions.
-type SessionRequestCallback func(sess Session, requestType string) bool
+// Returning false, nil denies the request. A non-nil error is passed to
+// ErrorHandler and ends the session by default.
+type SessionRequestCallback func(sess Session, requestType string) (bool, error)
 
 // AgentForwardingCallback is a hook for allowing agent forwarding per session.
-// A nil callback denies agent forwarding.
-type AgentForwardingCallback func(ctx Context) bool
+// A nil callback or false, nil denies agent forwarding. A non-nil error is
+// passed to ErrorHandler and ends the session by default.
+type AgentForwardingCallback func(ctx Context, sess Session) (bool, error)
 
 // ConnCallback is a hook for new connections before handling.
 // It allows wrapping for timeouts and limiting by returning
 // the net.Conn that will be used as the underlying connection.
 // Implementations must return promptly and honor Context cancellation; network
 // deadlines cannot forcibly stop callback code that blocks without doing I/O.
-type ConnCallback func(ctx Context, conn net.Conn) net.Conn
+// Returning nil, nil drops the connection without reporting an operational
+// error. A non-nil error aborts the SSH handshake. A returned connection must
+// own the input connection and close it when the returned connection is closed.
+type ConnCallback func(ctx Context, conn net.Conn) (net.Conn, error)
 
-// LocalPortForwardingCallback is a hook for allowing port forwarding
-type LocalPortForwardingCallback func(ctx Context, destinationHost string, destinationPort uint32) bool
+// LocalPortForwardingCallback is a hook for allowing port forwarding. Returning
+// false, nil denies the request; a non-nil error is passed to ErrorHandler.
+type LocalPortForwardingCallback func(ctx Context, conn gossh.ConnMetadata, destinationHost string, destinationPort uint32) (bool, error)
 
-// ReversePortForwardingCallback is a hook for allowing reverse port forwarding
-type ReversePortForwardingCallback func(ctx Context, bindHost string, bindPort uint32) bool
+// ReversePortForwardingCallback is a hook for allowing reverse port forwarding.
+// Returning false, nil denies the request; a non-nil error is passed to
+// ErrorHandler.
+type ReversePortForwardingCallback func(ctx Context, conn gossh.ConnMetadata, bindHost string, bindPort uint32) (bool, error)
 
 // LocalUnixForwardingCallback handles a direct-streamlocal@openssh.com request.
 // A successful callback transfers ownership of the returned connection to the
 // server. Return [ErrServerPermissionDenied] to reject the request without
 // exposing an operational error to the client. Implementations must honor
 // context cancellation.
-type LocalUnixForwardingCallback func(ctx Context, socketPath string) (net.Conn, error)
+type LocalUnixForwardingCallback func(ctx Context, conn gossh.ConnMetadata, socketPath string) (net.Conn, error)
 
 // ReverseUnixForwardingCallback handles a streamlocal-forward@openssh.com
 // request. A successful callback transfers ownership of the returned listener
@@ -97,25 +120,28 @@ type LocalUnixForwardingCallback func(ctx Context, socketPath string) (net.Conn,
 // application policy. Callbacks returning a *net.UnixListener must also choose
 // appropriate unlink-on-close behavior. Implementations must honor context
 // cancellation.
-type ReverseUnixForwardingCallback func(ctx Context, socketPath string) (net.Listener, error)
+type ReverseUnixForwardingCallback func(ctx Context, conn gossh.ConnMetadata, socketPath string) (net.Listener, error)
 
-// ServerConfigCallback customizes a fresh per-connection server config. Public
+// ServerConfigCallback customizes a fresh per-connection server config. A
+// returned error aborts the SSH handshake. Public
 // key multi-factor authentication must return PartialSuccessError from
 // VerifiedPublicKeyCallback, after key ownership has been proven. Configuring a
 // PasswordCallback, PublicKeyCallback, or KeyboardInteractiveCallback together
 // with the corresponding high-level Server handler rejects that auth method with
 // ErrServerAuthCallbackConflict rather than silently replacing either policy.
-type ServerConfigCallback func(ctx Context, config *gossh.ServerConfig)
+type ServerConfigCallback func(ctx Context, conn net.Conn, config *gossh.ServerConfig) error
 
-// ConnectionFailedCallback is a hook for reporting failed connections
-// Please note: the net.Conn is likely to be closed at this point
-type ConnectionFailedCallback func(conn net.Conn, err error)
+// ConnectionFailedCallback is a hook for reporting failed connections. The
+// net.Conn is likely to be closed at this point. A returned error is joined with
+// the connection failure before it is passed to ErrorHandler.
+type ConnectionFailedCallback func(ctx Context, conn net.Conn, err error) error
 
 // DisconnectCallback is called exactly once after a successfully established
 // SSH connection ends. The Context is canceled, the connection is closed, and
 // connection workers have stopped before the callback runs. Implementations must
-// return promptly. Panics from the callback are not recovered.
-type DisconnectCallback func(ctx Context, conn net.Conn)
+// return promptly. A returned error is passed to ErrorHandler. Panics from the
+// callback are not recovered.
+type DisconnectCallback func(ctx Context, conn net.Conn) error
 
 // Window represents the informational dimensions of a PTY window. Width and
 // Height are measured in characters; WidthPixels and HeightPixels describe the

@@ -13,8 +13,9 @@ const listenAddress = "127.0.0.1:2222"
 func main() {
 	server := &ssh.Server{
 		Addr: listenAddress,
-		Handler: func(session ssh.Session) {
-			_, _ = fmt.Fprintf(session, "Your address is %s\n", session.RemoteAddr())
+		Handler: func(session ssh.Session) error {
+			_, err := fmt.Fprintf(session, "Your address is %s\n", session.RemoteAddr())
+			return err
 		},
 		ProxyProtocol: &ssh.ProxyProtocolConfig{},
 	}

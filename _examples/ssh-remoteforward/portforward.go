@@ -2,10 +2,11 @@ package main
 
 import (
 	"context"
-	"io"
+	"fmt"
 	"log"
 
 	"github.com/engity-com/ssh-server-go"
+	gossh "golang.org/x/crypto/ssh"
 )
 
 func main() {
@@ -13,12 +14,13 @@ func main() {
 
 	server := ssh.Server{
 		Addr: "127.0.0.1:2222",
-		Handler: ssh.Handler(func(s ssh.Session) {
-			_, _ = io.WriteString(s, "Remote forwarding available...\n")
+		Handler: ssh.Handler(func(s ssh.Session) error {
+			_, err := fmt.Fprintln(s, "Remote forwarding available...")
+			return err
 		}),
-		ReversePortForwardingCallback: ssh.ReversePortForwardingCallback(func(ctx ssh.Context, host string, port uint32) bool {
+		ReversePortForwardingCallback: ssh.ReversePortForwardingCallback(func(ctx ssh.Context, conn gossh.ConnMetadata, host string, port uint32) (bool, error) {
 			log.Println("attempt to bind", host, port, "granted")
-			return true
+			return true, nil
 		}),
 		RequestHandlers: map[string]ssh.RequestHandler{
 			"tcpip-forward":        forwardHandler.HandleSSHRequest,

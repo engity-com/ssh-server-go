@@ -42,20 +42,22 @@ func TestProxyProtocolReportsHeaderAddresses(t *testing.T) {
 					ReadHeaderTimeout: time.Second,
 					ReadBufferSize:    512,
 				},
-				ConnCallback: func(_ Context, conn net.Conn) net.Conn {
+				ConnCallback: func(_ Context, conn net.Conn) (net.Conn, error) {
 					callbackRemote <- conn.RemoteAddr().String()
-					return conn
+					return conn, nil
 				},
-				ConnectionFailedCallback: func(_ net.Conn, err error) {
+				ConnectionFailedCallback: func(_ Context, _ net.Conn, err error) error {
 					failures <- err
+					return nil
 				},
-				Handler: func(session Session) {
+				Handler: func(session Session) error {
 					observed <- addresses{
 						remote:        session.RemoteAddr().String(),
 						local:         session.LocalAddr().String(),
 						contextRemote: session.Context().RemoteAddr().String(),
 						contextLocal:  session.Context().LocalAddr().String(),
 					}
+					return nil
 				},
 			}
 			listener := newLocalListener()
@@ -126,7 +128,7 @@ func TestProxyProtocolConnPolicyCanSkipHeaderProcessing(t *testing.T) {
 				return nil
 			},
 		},
-		Handler: func(Session) {},
+		Handler: func(Session) error { return nil },
 	}, nil)
 	defer cleanup()
 	require.NoError(t, session.Run(""))
@@ -180,9 +182,9 @@ func TestProxyProtocolValidatorRejectsHeader(t *testing.T) {
 		ProxyProtocol: &ProxyProtocolConfig{ValidateHeader: func(*proxyproto.Header) error {
 			return expected
 		}},
-		ConnCallback: func(_ Context, conn net.Conn) net.Conn {
+		ConnCallback: func(_ Context, conn net.Conn) (net.Conn, error) {
 			callbackCalls.Add(1)
-			return conn
+			return conn, nil
 		},
 	}
 	serverConn, clientConn := net.Pipe()
@@ -262,9 +264,6 @@ func TestHandleConnContextStopsProxyProtocolHeaderRead(t *testing.T) {
 		defer close(done)
 		_ = srv.HandleConn(ctx, serverConn)
 	}()
-	require.Eventually(t, func() bool {
-		return activeConnectionCount(srv) == 1
-	}, time.Second, time.Millisecond)
 	writeDone := make(chan error, 1)
 	go func() {
 		_, err := clientConn.Write([]byte("PROXY "))
@@ -282,7 +281,6 @@ func TestHandleConnContextStopsProxyProtocolHeaderRead(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("context cancellation did not stop PROXY header processing")
 	}
-	require.Zero(t, activeConnectionCount(srv))
 }
 
 func TestProxyProtocolRejectsAlreadyWrappedConnection(t *testing.T) {
@@ -313,17 +311,4 @@ func TestEnableProxyProtocolOption(t *testing.T) {
 	err := srv.SetOption(EnableProxyProtocol(ProxyProtocolConfig{}, ProxyProtocolConfig{}))
 	require.Error(t, err)
 	require.Nil(t, srv.ProxyProtocol)
-}
-
-func TestProxyProtocolConfigIsSnapshotted(t *testing.T) {
-	srv := &Server{
-		ProxyProtocol: &ProxyProtocolConfig{ReadHeaderTimeout: time.Second, ReadBufferSize: 512},
-	}
-	settings := srv.connectionSettings()
-	srv.ProxyProtocol.ReadHeaderTimeout = 2 * time.Second
-	srv.ProxyProtocol.ReadBufferSize = 1024
-	srv.ProxyProtocol = nil
-	require.NotNil(t, settings.proxyProtocol)
-	require.Equal(t, time.Second, settings.proxyProtocol.ReadHeaderTimeout)
-	require.Equal(t, 512, settings.proxyProtocol.ReadBufferSize)
 }

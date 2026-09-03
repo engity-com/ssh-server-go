@@ -89,10 +89,16 @@ func enrichLoggerForServerConnection(in log.Logger, conn *gossh.ServerConn) log.
 	}
 	return in.
 		With("ssh.remote", fields.LazyFunc(func() any {
-			return conn.RemoteAddr()
+			if v := conn.RemoteAddr(); v != nil {
+				return v.String()
+			}
+			return fields.Exclude
 		})).
 		With("ssh.local", fields.LazyFunc(func() any {
-			return conn.LocalAddr()
+			if v := conn.LocalAddr(); v != nil {
+				return v.String()
+			}
+			return fields.Exclude
 		})).
 		With("ssh.user", fields.LazyFunc(func() any {
 			if v := conn.User(); v != "" {
