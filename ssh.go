@@ -42,13 +42,9 @@ func getDefaultHandler() Handler {
 // Option is a functional option handler for Server.
 type Option func(*Server) error
 
-// Handler is a callback for handling established SSH sessions. A returned error
-// is passed to ErrorHandler. Unless it is handled with canContinue set to true,
-// the server attempts to end the session with exit status 1. An explicit prior
-// call to Session.Exit takes precedence, and closing the connection from the
-// ErrorResponder can prevent delivery of an automatic exit status. A returned
-// SessionExitError requests a controlled message and exit status without
-// invoking ErrorHandler when both can be delivered successfully.
+// Handler handles an established SSH session. Returned errors are passed to
+// [ErrorHandler] and end the session by default. Return [SessionExitError] for
+// a controlled client message and exit status.
 type Handler func(Session) error
 
 // BannerHandler resolves the server banner for a connection. A returned error

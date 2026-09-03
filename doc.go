@@ -39,10 +39,8 @@ server's behavior is by creating a custom Server:
 
 	log.Fatal(s.ListenAndServe(ctx))
 
-A Server is immutable after its first Serve or HandleConn call. Its fields and
-referenced configuration values must be fully configured before that point. An
-immutable Server may be reused concurrently. Runtime state and limits belong to
-each individual Serve or HandleConn call and are not aggregated across calls.
+See [Server] for lifecycle rules, [ErrorHandler] for operational errors, and
+[SessionExitError] for controlled session failures.
 
 This package handles basic SSH requests such as environment variables, PTYs,
 window changes, signals, and breaks. Relevant state and delivery hooks are
