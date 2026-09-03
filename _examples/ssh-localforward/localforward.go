@@ -34,6 +34,6 @@ func main() {
 	}
 
 	log.Println("DEVELOPMENT ONLY: anonymous authentication and an ephemeral host key")
-	log.Printf("starting SSH server on %s; connect with ssh -N -L 8081:%s:%d -p 2222 localhost", listenAddress, destinationHost, destinationPort)
+	log.Printf("starting SSH server on %s; connect with ssh -N -L 8081:%s:%d -p 2222 127.0.0.1", listenAddress, destinationHost, destinationPort)
 	log.Fatal(server.ListenAndServe(context.Background()))
 }
