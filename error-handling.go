@@ -146,50 +146,19 @@ func (v *ErrorOperation) Set(text string) error {
 	return v.UnmarshalText([]byte(text))
 }
 
-// ErrorResponder sends a protocol-appropriate error message to the client. For
-// a session it writes to stderr, for a request it sends a negative reply, and
-// for a channel it rejects the channel if it has not already been accepted or
-// rejected. Other locations return ErrErrorResponseUnsupported. A responder is
-// valid only for the duration of its ErrorHandler invocation and may be called
-// at most once. If closeAfterResponse is true, the associated SSH connection is
-// closed after the response attempt, including when sending the response fails.
-// The transport can bound message size or abort a blocked response.
+// ErrorResponder sends a scope-appropriate response to the client. It is valid
+// only during its [ErrorHandler] call and may be used once. closeAfterResponse
+// closes the associated SSH connection after the response attempt.
 type ErrorResponder func(message []byte, closeAfterResponse bool) error
 
-// ErrorHandler handles operational errors synchronously and can be invoked by
-// multiple connections concurrently. Implementations must return promptly. The
-// responder never exposes the underlying channel or connection. respond and
-// next are valid only until the invocation returns and may each be called at
-// most once. A server-accept invocation can also be abandoned when its context
-// is canceled so that shutdown is not held up by a blocked handler.
-// next is always non-nil and invokes the caller-specific default error action.
-// It retains the original context, scope, operation, and responder; only the
-// error passed to next is used. A handler may handle the error itself, pass a
-// wrapped error to next, or suppress the error by returning a nil filteredErr.
+// ErrorHandler handles operational errors. scope and operation identify their
+// source, respond sends a client-safe response, and next applies the default
+// handling.
 //
-// A non-nil filteredErr always requires the caller to stop the current
-// operation immediately; canContinue is ignored in that case. Returning false,
-// nil means that the error was handled but the current operation must stop.
-// Returning true, nil means that the error was handled and the caller may
-// continue as if it had not occurred. canContinue is permission rather than a
-// guarantee: the caller may still stop if its protocol or resource state makes
-// continuing impossible.
-//
-// For server accept errors, true permits another accept attempt. For request
-// errors, true permits processing the next request, while false closes the SSH
-// connection after any response. For session errors, true treats the handler as
-// successful and false uses a failing exit status. Channel handlers and
-// one-shot forwarding workers cannot be re-entered after returning, so true can
-// only preserve their parent connection or forwarding scope. Forward-listener
-// accept errors may be retried with backoff. A non-nil filteredErr causes the
-// associated SSH connection to be closed where one exists, because a failure in
-// error handling cannot safely be ignored. A failed session response is isolated
-// to its channel when the filtered error is that same response failure.
-//
-// Calls can originate concurrently. To prevent a blocked handler from
-// exhausting server resources, each Serve or HandleConn call bounds concurrent
-// invocations and sends excess errors directly to the caller-specific next
-// handler.
+// respond and next are valid only during the call and may each be used once. A
+// non-nil filteredErr stops processing; otherwise canContinue permits, but does
+// not guarantee, continued processing. Calls may run concurrently and must
+// return promptly.
 type ErrorHandler func(
 	ctx context.Context,
 	scope ErrorScope,

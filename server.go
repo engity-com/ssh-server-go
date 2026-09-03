@@ -172,13 +172,13 @@ type MaxStartupsConfig struct {
 	Full  int // hard limit for unauthenticated connections; nonpositive disables the limit
 }
 
-// Server defines parameters for running an SSH server. The zero value for
-// Server is a valid configuration. When both PasswordHandler and
-// PublicKeyHandler are nil, no client authentication is performed. Public
-// fields and referenced maps, slices, pointers, or callback state must not be
-// mutated after Server has first been passed to Serve or HandleConn. A Server
-// may be reused by concurrent Serve and HandleConn calls when its configuration
-// remains immutable. Server must not be copied after first use.
+// Server configures an SSH server. Its zero value is valid and does not require
+// client authentication.
+//
+// Configure Server and its referenced values before the first [Server.Serve] or
+// [Server.HandleConn] call. It must not be copied or modified after first use,
+// but may be reused concurrently. Each call owns independent runtime state and
+// limits.
 type Server struct {
 	Logger log.Logger
 

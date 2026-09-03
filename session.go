@@ -105,12 +105,10 @@ type Session interface {
 	Break(c chan<- bool)
 }
 
-// SessionExitError requests a controlled session exit from a Handler or
-// SubsystemHandler. Message is public and is written to the session's stderr
-// before the session exits with Code. Successful handling does not invoke
-// ErrorHandler; failures while writing the message or sending the exit status
-// are reported with ErrorOperationReply. Wrapping preserves this behavior, but
-// joining an independent error makes the complete result an operational error.
+// SessionExitError requests a public message and exit status from a Handler or
+// SubsystemHandler. It bypasses [ErrorHandler] unless sending the response
+// fails. Wrapping preserves this behavior; joining another error routes the
+// result through [ErrorHandler].
 type SessionExitError struct {
 	Code    int
 	Message string
