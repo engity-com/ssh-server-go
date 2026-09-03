@@ -105,5 +105,5 @@ func parseUint32(in []byte) (uint32, []byte, bool) {
 
 func uint32ToInt(value uint32) (int, bool) {
 	result := int(value)
-	return result, result >= 0 && uint32(result) == value
+	return result, result >= 0 && uint32(result) == value // #nosec G115 -- the round trip is the overflow check
 }

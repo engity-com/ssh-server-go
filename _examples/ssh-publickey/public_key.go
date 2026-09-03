@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
 	"log"
 
 	"github.com/engity-com/ssh-server-go"
@@ -11,14 +10,17 @@ import (
 )
 
 func main() {
-	ssh.Handle(func(s ssh.Session) {
+	ssh.Handle(func(s ssh.Session) error {
 		authorizedKey := gossh.MarshalAuthorizedKey(s.PublicKey())
-		io.WriteString(s, fmt.Sprintf("public key used by %s:\n", s.User()))
-		s.Write(authorizedKey)
+		if _, err := fmt.Fprintf(s, "public key used by %s:\n", s.User()); err != nil {
+			return err
+		}
+		_, err := s.Write(authorizedKey)
+		return err
 	})
 
-	publicKeyOption := ssh.PublicKeyAuth(func(ctx ssh.Context, key ssh.PublicKey) bool {
-		return true // allow all keys, or use ssh.KeysEqual() to compare against known keys
+	publicKeyOption := ssh.PublicKeyAuth(func(ctx ssh.Context, conn gossh.ConnMetadata, key ssh.PublicKey) (bool, error) {
+		return true, nil // allow all keys, or use ssh.KeysEqual() to compare against known keys
 	})
 
 	log.Println("DEVELOPMENT ONLY: every public key is accepted and the host key is ephemeral")

@@ -2,6 +2,7 @@ package ssh
 
 import (
 	"context"
+	"errors"
 	"net"
 	"strings"
 	"sync/atomic"
@@ -26,7 +27,8 @@ func TestPasswordAuth(t *testing.T) {
 	testUser := "testuser"
 	testPass := "testpass"
 	session, _, cleanup := newTestSessionWithOptions(t, &Server{
-		Handler: func(s Session) {
+		Handler: func(s Session) error {
+			return nil
 			// noop
 		},
 	}, &gossh.ClientConfig{
@@ -35,14 +37,14 @@ func TestPasswordAuth(t *testing.T) {
 			gossh.Password(testPass),
 		},
 		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
-	}, PasswordAuth(func(ctx Context, password string) bool {
+	}, PasswordAuth(func(ctx Context, _ gossh.ConnMetadata, password string) (bool, error) {
 		if ctx.User() != testUser {
 			t.Fatalf("user = %#v; want %#v", ctx.User(), testUser)
 		}
 		if password != testPass {
 			t.Fatalf("user = %#v; want %#v", password, testPass)
 		}
-		return true
+		return true, nil
 	}))
 	defer cleanup()
 	if err := session.Run(""); err != nil {
@@ -53,9 +55,9 @@ func TestPasswordAuth(t *testing.T) {
 func TestPasswordAuthBadPass(t *testing.T) {
 	t.Parallel()
 	l := newLocalListener()
-	srv := &Server{Handler: func(s Session) {}}
-	if err := srv.SetOption(PasswordAuth(func(ctx Context, password string) bool {
-		return false
+	srv := &Server{Handler: func(s Session) error { return nil }}
+	if err := srv.SetOption(PasswordAuth(func(ctx Context, _ gossh.ConnMetadata, password string) (bool, error) {
+		return false, nil
 	})); err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +95,8 @@ func TestConnWrapping(t *testing.T) {
 	t.Parallel()
 	var wrapped *wrappedConn
 	session, _, cleanup := newTestSessionWithOptions(t, &Server{
-		Handler: func(s Session) {
+		Handler: func(s Session) error {
+			return nil
 			// nothing
 		},
 	}, &gossh.ClientConfig{
@@ -102,11 +105,11 @@ func TestConnWrapping(t *testing.T) {
 			gossh.Password("testpass"),
 		},
 		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
-	}, PasswordAuth(func(ctx Context, password string) bool {
-		return true
-	}), WrapConn(func(ctx Context, conn net.Conn) net.Conn {
+	}, PasswordAuth(func(ctx Context, _ gossh.ConnMetadata, password string) (bool, error) {
+		return true, nil
+	}), WrapConn(func(ctx Context, conn net.Conn) (net.Conn, error) {
 		wrapped = &wrappedConn{conn, 0}
-		return wrapped
+		return wrapped, nil
 	}))
 	defer cleanup()
 	if err := session.Shell(); err != nil {
@@ -120,18 +123,38 @@ func TestConnWrapping(t *testing.T) {
 func TestNewGracefulShutdownTimeoutHandler(t *testing.T) {
 	timeout := 3 * time.Second
 	handler := NewGracefulShutdownTimeoutHandler(timeout)
-	require.Equal(t, timeout, handler(context.Background()))
+	actual, err := handler(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, timeout, actual)
 }
 
 func TestWithGracefulShutdownHandler(t *testing.T) {
 	handler := NewGracefulShutdownTimeoutHandler(time.Second)
 	srv := &Server{}
 	require.NoError(t, srv.SetOption(WithGracefulShutdownHandler(handler)))
-	require.Equal(t, time.Second, srv.GracefulShutdownHandler(context.Background()))
+	actual, err := srv.GracefulShutdownHandler(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, time.Second, actual)
+}
+
+func TestWithErrorHandler(t *testing.T) {
+	called := false
+	handler := func(context.Context, ErrorScope, ErrorOperation, error, ErrorResponder, ErrorHandler) (bool, error) {
+		called = true
+		return true, nil
+	}
+	srv := &Server{}
+	require.NoError(t, srv.SetOption(WithErrorHandler(handler)))
+	require.NotNil(t, srv.ErrorHandler)
+	_, err := srv.ErrorHandler(context.Background(), ErrorScopeServer, ErrorOperationAccept, errors.New("test"), nil, nil)
+	require.NoError(t, err)
+	require.True(t, called)
 }
 
 func TestWithGracefulShutdownTimeout(t *testing.T) {
 	srv := &Server{}
 	require.NoError(t, srv.SetOption(WithGracefulShutdownTimeout(2*time.Second)))
-	require.Equal(t, 2*time.Second, srv.GracefulShutdownHandler(context.Background()))
+	actual, err := srv.GracefulShutdownHandler(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 2*time.Second, actual)
 }

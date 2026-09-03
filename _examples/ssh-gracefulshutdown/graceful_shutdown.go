@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"errors"
-	"io"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -19,15 +19,15 @@ func main() {
 	server := &ssh.Server{
 		Addr:                    "127.0.0.1:2222",
 		GracefulShutdownHandler: ssh.NewGracefulShutdownTimeoutHandler(10 * time.Second),
-		Handler: func(session ssh.Session) {
-			_, _ = io.WriteString(session, "Press Ctrl+C in the server terminal to stop gracefully.\n")
+		Handler: func(session ssh.Session) error {
+			_, err := fmt.Fprintln(session, "Press Ctrl+C in the server terminal to stop gracefully.")
+			return err
 		},
 	}
 
 	log.Println("DEVELOPMENT ONLY: anonymous authentication and an ephemeral host key")
 	log.Println("starting SSH server on 127.0.0.1:2222; press Ctrl+C to stop")
-	if err := server.ListenAndServe(ctx); err != nil &&
-		(!errors.Is(err, context.Canceled) || errors.Is(err, ssh.ErrGracefulShutdownTimeout)) {
+	if err := server.ListenAndServe(ctx); err != nil && (!errors.Is(err, context.Canceled) || errors.Is(err, ssh.ErrGracefulShutdownTimeout)) {
 		log.Fatal(err)
 	} else if err != nil {
 		log.Printf("server stopped: %v", err)

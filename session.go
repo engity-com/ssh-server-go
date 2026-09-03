@@ -2,17 +2,26 @@ package ssh
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
+	"math"
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/anmitsu/go-shlex"
 	"github.com/echocat/slf4g"
 	"github.com/echocat/slf4g/names"
 	gossh "golang.org/x/crypto/ssh"
+)
+
+const (
+	maxSessionErrorResponseBytes = 4096
+	sessionErrorResponseTimeout  = time.Second
 )
 
 // Session provides access to information about an SSH session and methods
@@ -96,43 +105,67 @@ type Session interface {
 	Break(c chan<- bool)
 }
 
-// maxSigBufSize is how many signals will be buffered
-// when there is no signal channel specified
-const maxSigBufSize = 128
+// SessionExitError requests a controlled session exit from a Handler or
+// SubsystemHandler. Message is public and is written to the session's stderr
+// before the session exits with Code. Successful handling does not invoke
+// ErrorHandler; failures while writing the message or sending the exit status
+// are reported with ErrorOperationReply. Wrapping preserves this behavior, but
+// joining an independent error makes the complete result an operational error.
+type SessionExitError struct {
+	Code    int
+	Message string
+}
+
+// NewSessionExitError creates a controlled session exit.
+func NewSessionExitError(code int, message string) *SessionExitError {
+	return &SessionExitError{Code: code, Message: message}
+}
+
+func (e *SessionExitError) Error() string {
+	if e == nil {
+		return "ssh: session exit requested"
+	}
+	if e.Message == "" {
+		return fmt.Sprintf("ssh: session exit requested with code %d", e.Code)
+	}
+	return fmt.Sprintf("ssh: session exit requested with code %d: %s", e.Code, e.Message)
+}
+
+const (
+	// Signal names are short RFC 4254 identifiers. Bounding their size prevents
+	// clients from retaining packet-sized strings in every session buffer.
+	maxSessionSignalBytes = 64
+	maxSigBufSize         = 128
+)
 
 const (
 	maxSessionEnvVariables = 128
 	maxSessionEnvBytes     = 64 * 1024
 )
 
-func DefaultSessionHandler(srv *Server, conn *gossh.ServerConn, newChan gossh.NewChannel, ctx Context) {
-	settings := serverSettingsFromContext(ctx, srv)
+func DefaultSessionHandler(srv *Server, conn *gossh.ServerConn, newChan gossh.NewChannel, ctx Context) error {
 	ch, reqs, err := newChan.Accept()
 	if err != nil {
-		logger := settings.logger
-		if logger == nil {
-			logger = srv.logger()
-		}
-		enrichLoggerForServerConnection(logger, conn).
-			WithError(err).
-			Warn("failed to accept new channel")
-		return
+		return locateError(ErrorScopeChannel, ErrorOperationAccept, err)
 	}
 	sess := &session{
 		Channel:           ch,
 		conn:              conn,
-		handler:           settings.handler,
-		ptyCb:             settings.ptyCallback,
-		sessReqCb:         settings.sessionRequestCallback,
-		agentForwardingCb: settings.agentForwardingCallback,
-		subsystemHandlers: settings.subsystemHandlers,
+		handler:           srv.handler(),
+		ptyCb:             srv.PtyCallback,
+		sessReqCb:         srv.SessionRequestCallback,
+		agentForwardingCb: srv.AgentForwardingCallback,
+		subsystemHandlers: srv.subsystemHandlers(),
+		errorHandler:      errorHandlerFromContext(ctx, srv),
+		requestTimeout:    configuredDuration(srv.SessionRequestTimeout, DefaultSessionRequestTimeout),
 		ctx:               &sessionAgentContext{Context: ctx},
-		logger:            settings.logger,
+		logger:            srv.Logger,
 	}
 	sess.handleRequests(reqs)
 	if sess.handlerDone != nil {
 		<-sess.handlerDone
 	}
+	return nil
 }
 
 type session struct {
@@ -145,6 +178,7 @@ type session struct {
 	conn              *gossh.ServerConn
 	handler           Handler
 	subsystemHandlers map[string]SubsystemHandler
+	errorHandler      ErrorHandler
 	handled           bool
 	exited            bool
 	pty               *Pty
@@ -169,7 +203,9 @@ type session struct {
 	breakSendWg       sync.WaitGroup
 	breakSends        int
 	exiting           atomic.Bool
+	requestStarted    atomic.Bool
 	handlerDone       <-chan struct{}
+	requestTimeout    time.Duration
 	logger            log.Logger
 }
 
@@ -211,6 +247,9 @@ func (sess *session) Context() Context {
 }
 
 func (sess *session) Exit(code int) error {
+	if code < 0 || uint64(code) > uint64(math.MaxUint32) {
+		return fmt.Errorf("ssh: invalid session exit status %d", code)
+	}
 	sess.Lock()
 	sess.exiting.Store(true)
 	sess.Unlock()
@@ -227,12 +266,9 @@ func (sess *session) Exit(code int) error {
 	}
 	sess.exited = true
 
-	status := struct{ Status uint32 }{uint32(code)}
-	_, err := sess.SendRequest("exit-status", false, gossh.Marshal(&status))
-	if err != nil {
-		return err
-	}
-	return sess.Close()
+	status := struct{ Status uint32 }{uint32(code)} // #nosec G115 -- range checked above
+	_, requestErr := sess.SendRequest("exit-status", false, gossh.Marshal(&status))
+	return errors.Join(requestErr, sess.Close())
 }
 
 func (sess *session) User() string {
@@ -481,6 +517,10 @@ func (sess *session) handleSignalRequest(req *gossh.Request) bool {
 		_ = req.Reply(false, nil)
 		return true
 	}
+	if len(payload.Signal) > maxSessionSignalBytes {
+		_ = req.Reply(false, nil)
+		return true
+	}
 	sess.Lock()
 	if sess.exiting.Load() {
 		sess.Unlock()
@@ -518,17 +558,149 @@ func (sess *session) handleSignalRequest(req *gossh.Request) bool {
 	return !contextDone
 }
 
-func (sess *session) startHandler(handler func(Session)) {
+func (sess *session) startHandler(handler func(Session) error) {
 	done := make(chan struct{})
 	sess.handlerDone = done
 	go func() {
 		defer close(done)
-		handler(sess)
-		_ = sess.Exit(0)
+		err := handler(sess)
+		if requestedExit, ok := exclusiveSessionExitError(err); ok {
+			sess.Lock()
+			exited := sess.exited
+			sess.Unlock()
+			if !exited {
+				if exitErr := sess.applyExitError(requestedExit); exitErr != nil {
+					dispatchErrorOrEscalate(sess.ctx, sess.getLogger(), sess.errorHandler, ErrorScopeSession, ErrorOperationReply, exitErr, nil, defaultLogAndFailErrorAction)
+				}
+			}
+			return
+		}
+		canContinue := err == nil
+		closeRequested := false
+		if err != nil {
+			response := newErrorResponse(sess.respondToError)
+			var filteredErr error
+			canContinue, filteredErr = dispatchError(sess.ctx, sess.getLogger(), sess.errorHandler, ErrorScopeSession, ErrorOperationHandle, err, response, defaultLogAndFailErrorAction)
+			_, responseErr := response.result()
+			responseFailureHandled := false
+			if filteredErr != nil {
+				if responseErr != nil && !errors.Is(responseErr, ErrErrorResponseUnsupported) && isOnlyError(filteredErr, responseErr) {
+					logDispatchErrorEscalate(sess.getLogger(), ErrorScopeSession, ErrorOperationReply, responseErr, err)
+					closeQuietly(sess)
+					responseFailureHandled = true
+				} else {
+					logDispatchErrorEscalate(sess.getLogger(), ErrorScopeSession, ErrorOperationHandle, filteredErr, err)
+					closeQuietly(sess.conn)
+				}
+				canContinue = false
+			}
+			closeRequested = response.closeRequested()
+			if responseErr != nil && !errors.Is(responseErr, ErrErrorResponseUnsupported) && !responseFailureHandled {
+				logDispatchErrorEscalate(sess.getLogger(), ErrorScopeSession, ErrorOperationReply, responseErr, err)
+				closeQuietly(sess)
+				canContinue = false
+			}
+		}
+		sess.Lock()
+		exited := sess.exited
+		sess.Unlock()
+		if closeRequested {
+			closeQuietly(sess)
+			return
+		}
+		if !exited {
+			status := 0
+			if err != nil && !canContinue {
+				status = 1
+			}
+			if exitErr := sess.Exit(status); exitErr != nil {
+				dispatchErrorOrEscalate(sess.ctx, sess.getLogger(), sess.errorHandler, ErrorScopeSession, ErrorOperationReply, exitErr, nil, defaultLogAndFailErrorAction)
+			}
+		}
 	}()
 }
 
+func exclusiveSessionExitError(err error) (*SessionExitError, bool) {
+	if err == nil {
+		return nil, false
+	}
+	if exitErr, ok := err.(*SessionExitError); ok && exitErr != nil {
+		return exitErr, true
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		var result *SessionExitError
+		for _, child := range joined.Unwrap() {
+			exitErr, exclusive := exclusiveSessionExitError(child)
+			if !exclusive || result != nil {
+				return nil, false
+			}
+			result = exitErr
+		}
+		return result, result != nil
+	}
+	if wrapped := errors.Unwrap(err); wrapped != nil {
+		return exclusiveSessionExitError(wrapped)
+	}
+	var exitErr *SessionExitError
+	if errors.As(err, &exitErr) && exitErr != nil {
+		return exitErr, true
+	}
+	return nil, false
+}
+
+func (sess *session) applyExitError(exitErr *SessionExitError) error {
+	var responseErr error
+	if exitErr.Message != "" {
+		responseErr = sess.respondToError([]byte(exitErr.Message), false)
+	}
+	return errors.Join(responseErr, sess.Exit(exitErr.Code))
+}
+
+func (sess *session) respondToError(message []byte, closeAfterResponse bool) error {
+	return sess.respondToErrorWithin(message, closeAfterResponse, sessionErrorResponseTimeout)
+}
+
+func (sess *session) respondToErrorWithin(message []byte, closeAfterResponse bool, timeout time.Duration) error {
+	if len(message) > maxSessionErrorResponseBytes {
+		message = message[:maxSessionErrorResponseBytes]
+	}
+	message = append([]byte(nil), message...)
+	written := make(chan error, 1)
+	go func() {
+		n, err := sess.Stderr().Write(message)
+		if err == nil && n != len(message) {
+			err = io.ErrShortWrite
+		}
+		written <- err
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	var err error
+	select {
+	case err = <-written:
+	case <-sess.ctx.Done():
+		err = context.Cause(sess.ctx)
+		closeSSHConnection(sess.ctx)
+	case <-timer.C:
+		err = fmt.Errorf("write session error response: %w", context.DeadlineExceeded)
+		closeSSHConnection(sess.ctx)
+	}
+	if closeAfterResponse {
+		closeQuietly(sess.conn)
+	}
+	return err
+}
+
 func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
+	var requestTimer *time.Timer
+	if sess.requestTimeout > 0 {
+		requestTimer = time.AfterFunc(sess.requestTimeout, func() {
+			if !sess.requestStarted.Load() {
+				closeSSHConnection(sess.ctx)
+			}
+		})
+		defer requestTimer.Stop()
+	}
 	defer func() {
 		if sess.winch != nil {
 			close(sess.winch)
@@ -555,14 +727,30 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 
 			// If there's a session policy callback, we need to confirm before
 			// accepting the session.
-			if sess.sessReqCb != nil && !sess.sessReqCb(sess, req.Type) {
-				sess.rawCmd = ""
-				_ = req.Reply(false, nil)
-				continue
+			if sess.sessReqCb != nil {
+				allowed, err := sess.sessReqCb(sess, req.Type)
+				if err != nil {
+					sess.rawCmd = ""
+					if !sess.handleCallbackError(req, fmt.Errorf("authorize %s session request: %w", req.Type, err)) {
+						return
+					}
+					continue
+				}
+				if !allowed {
+					sess.rawCmd = ""
+					_ = req.Reply(false, nil)
+					continue
+				}
 			}
 
 			sess.handled = true
-			_ = req.Reply(true, nil)
+			if !sess.reply(req, true) {
+				return
+			}
+			sess.requestStarted.Store(true)
+			if requestTimer != nil {
+				requestTimer.Stop()
+			}
 
 			sess.startHandler(sess.handler)
 		case "subsystem":
@@ -581,10 +769,20 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 
 			// If there's a session policy callback, we need to confirm before
 			// accepting the session.
-			if sess.sessReqCb != nil && !sess.sessReqCb(sess, req.Type) {
-				sess.subsystem = ""
-				_ = req.Reply(false, nil)
-				continue
+			if sess.sessReqCb != nil {
+				allowed, err := sess.sessReqCb(sess, req.Type)
+				if err != nil {
+					sess.subsystem = ""
+					if !sess.handleCallbackError(req, fmt.Errorf("authorize subsystem session request: %w", err)) {
+						return
+					}
+					continue
+				}
+				if !allowed {
+					sess.subsystem = ""
+					_ = req.Reply(false, nil)
+					continue
+				}
 			}
 
 			handler := sess.subsystemHandlers[payload.Value]
@@ -598,7 +796,13 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 			}
 
 			sess.handled = true
-			_ = req.Reply(true, nil)
+			if !sess.reply(req, true) {
+				return
+			}
+			sess.requestStarted.Store(true)
+			if requestTimer != nil {
+				requestTimer.Stop()
+			}
 
 			sess.startHandler(handler)
 		case "env":
@@ -634,8 +838,14 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 				continue
 			}
 			if sess.ptyCb != nil {
-				ok := sess.ptyCb(sess.ctx, clonePty(ptyReq))
-				if !ok {
+				allowed, err := sess.ptyCb(sess.ctx, sess, clonePty(ptyReq))
+				if err != nil {
+					if !sess.handleCallbackError(req, fmt.Errorf("authorize PTY request: %w", err)) {
+						return
+					}
+					continue
+				}
+				if !allowed {
 					_ = req.Reply(false, nil)
 					continue
 				}
@@ -670,12 +880,25 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 			}
 			_ = req.Reply(ok, nil)
 		case agentRequestType:
-			if sess.agentForwardingCb == nil || !sess.agentForwardingCb(sess.ctx) {
+			if sess.agentForwardingCb == nil {
+				_ = req.Reply(false, nil)
+				continue
+			}
+			allowed, err := sess.agentForwardingCb(sess.ctx, sess)
+			if err != nil {
+				if !sess.handleCallbackError(req, fmt.Errorf("authorize agent forwarding: %w", err)) {
+					return
+				}
+				continue
+			}
+			if !allowed {
 				_ = req.Reply(false, nil)
 				continue
 			}
 			SetAgentRequested(sess.ctx)
-			_ = req.Reply(true, nil)
+			if !sess.reply(req, true) {
+				return
+			}
 		case "break":
 			sess.deliverBreakAndReply(func(ok bool) {
 				_ = req.Reply(ok, nil)
@@ -687,6 +910,77 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 			_ = req.Reply(false, nil)
 		}
 	}
+}
+
+func (sess *session) reply(req *gossh.Request, accepted bool) bool {
+	if err := req.Reply(accepted, nil); err != nil {
+		dispatchErrorOrEscalate(sess.ctx, sess.getLogger(), sess.errorHandler, ErrorScopeSession, ErrorOperationReply, err, nil, defaultLogAndFailErrorAction)
+		closeSSHConnection(sess.ctx)
+		return false
+	}
+	return true
+}
+
+func (sess *session) handleCallbackError(req *gossh.Request, callbackErr error) bool {
+	response := newErrorResponse(func(message []byte, _ bool) error {
+		return sess.respondToError(message, false)
+	})
+	canContinue, filteredErr := dispatchError(sess.ctx, sess.getLogger(), sess.errorHandler, ErrorScopeSession, ErrorOperationHandle, callbackErr, response, defaultLogAndFailErrorAction)
+	_, responseErr := response.result()
+	closeRequested := response.closeRequested()
+	if err := req.Reply(false, nil); err != nil {
+		dispatchErrorOrEscalate(sess.ctx, sess.getLogger(), sess.errorHandler, ErrorScopeSession, ErrorOperationReply, errors.Join(callbackErr, err), nil, defaultLogAndFailErrorAction)
+		responseFailureHandled := false
+		if filteredErr != nil {
+			if responseErr != nil && !errors.Is(responseErr, ErrErrorResponseUnsupported) && isOnlyError(filteredErr, responseErr) {
+				logDispatchErrorEscalate(sess.getLogger(), ErrorScopeSession, ErrorOperationReply, responseErr, callbackErr)
+				responseFailureHandled = true
+			} else {
+				logDispatchErrorEscalate(sess.getLogger(), ErrorScopeSession, ErrorOperationHandle, filteredErr, callbackErr)
+			}
+		}
+		if responseErr != nil && !errors.Is(responseErr, ErrErrorResponseUnsupported) && !responseFailureHandled {
+			logDispatchErrorEscalate(sess.getLogger(), ErrorScopeSession, ErrorOperationReply, responseErr, callbackErr)
+		}
+		if closeRequested || (filteredErr != nil && !responseFailureHandled) {
+			closeSSHConnection(sess.ctx)
+		} else {
+			closeQuietly(sess)
+		}
+		return false
+	}
+	if filteredErr != nil {
+		if responseErr != nil && !errors.Is(responseErr, ErrErrorResponseUnsupported) && isOnlyError(filteredErr, responseErr) {
+			logDispatchErrorEscalate(sess.getLogger(), ErrorScopeSession, ErrorOperationReply, responseErr, callbackErr)
+			if closeRequested {
+				closeSSHConnection(sess.ctx)
+			} else {
+				closeQuietly(sess)
+			}
+		} else {
+			logDispatchErrorEscalate(sess.getLogger(), ErrorScopeSession, ErrorOperationHandle, filteredErr, callbackErr)
+			closeSSHConnection(sess.ctx)
+		}
+		return false
+	}
+	if responseErr != nil && !errors.Is(responseErr, ErrErrorResponseUnsupported) {
+		logDispatchErrorEscalate(sess.getLogger(), ErrorScopeSession, ErrorOperationReply, responseErr, callbackErr)
+		if closeRequested {
+			closeSSHConnection(sess.ctx)
+		} else {
+			closeQuietly(sess)
+		}
+		return false
+	}
+	if closeRequested {
+		closeSSHConnection(sess.ctx)
+		return false
+	}
+	if !canContinue {
+		closeQuietly(sess)
+		return false
+	}
+	return true
 }
 
 func mergeWindow(current, update Window) Window {

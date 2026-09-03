@@ -2,10 +2,11 @@ package main
 
 import (
 	"context"
-	"io"
+	"fmt"
 	"log"
 
 	"github.com/engity-com/ssh-server-go"
+	gossh "golang.org/x/crypto/ssh"
 )
 
 const (
@@ -17,13 +18,14 @@ const (
 func main() {
 	server := ssh.Server{
 		Addr: listenAddress,
-		Handler: func(session ssh.Session) {
-			_, _ = io.WriteString(session, "Local forwarding is available\n")
+		Handler: func(session ssh.Session) error {
+			_, err := fmt.Fprintln(session, "Local forwarding is available")
+			return err
 		},
-		LocalPortForwardingCallback: func(_ ssh.Context, host string, port uint32) bool {
+		LocalPortForwardingCallback: func(_ ssh.Context, _ gossh.ConnMetadata, host string, port uint32) (bool, error) {
 			allowed := host == destinationHost && port == destinationPort
 			log.Printf("forward to %s:%d allowed: %t", host, port, allowed)
-			return allowed
+			return allowed, nil
 		},
 		ChannelHandlers: map[string]ssh.ChannelHandler{
 			"session":      ssh.DefaultSessionHandler,

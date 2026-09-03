@@ -3,12 +3,13 @@ package main
 import (
 	"context"
 	"errors"
-	"io"
+	"fmt"
 	"log"
 	"net"
 	"os"
 
 	"github.com/engity-com/ssh-server-go"
+	gossh "golang.org/x/crypto/ssh"
 )
 
 const (
@@ -22,21 +23,22 @@ func main() {
 
 	server := ssh.Server{
 		Addr: listenAddress,
-		Handler: func(session ssh.Session) {
-			_, _ = io.WriteString(session, "Unix socket forwarding is available\n")
+		Handler: func(session ssh.Session) error {
+			_, err := fmt.Fprintln(session, "Unix socket forwarding is available")
+			return err
 		},
 		ChannelHandlers: map[string]ssh.ChannelHandler{
 			"session":                        ssh.DefaultSessionHandler,
 			"direct-streamlocal@openssh.com": ssh.DirectStreamLocalHandler,
 		},
-		LocalUnixForwardingCallback: func(ctx ssh.Context, socketPath string) (net.Conn, error) {
+		LocalUnixForwardingCallback: func(ctx ssh.Context, conn gossh.ConnMetadata, socketPath string) (net.Conn, error) {
 			if socketPath != directSocketPath {
 				return nil, ssh.ErrServerPermissionDenied
 			}
 			var dialer net.Dialer
 			return dialer.DialContext(ctx, "unix", socketPath)
 		},
-		ReverseUnixForwardingCallback: func(ctx ssh.Context, socketPath string) (net.Listener, error) {
+		ReverseUnixForwardingCallback: func(ctx ssh.Context, conn gossh.ConnMetadata, socketPath string) (net.Listener, error) {
 			if socketPath != reverseSocketPath {
 				return nil, ssh.ErrServerPermissionDenied
 			}

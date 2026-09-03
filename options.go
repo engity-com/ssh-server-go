@@ -12,8 +12,8 @@ import (
 // NewGracefulShutdownTimeoutHandler returns a graceful shutdown handler that
 // always uses timeout.
 func NewGracefulShutdownTimeoutHandler(timeout time.Duration) GracefulShutdownHandler {
-	return func(context.Context) time.Duration {
-		return timeout
+	return func(context.Context) (time.Duration, error) {
+		return timeout, nil
 	}
 }
 
@@ -30,6 +30,15 @@ func WithGracefulShutdownHandler(handler GracefulShutdownHandler) Option {
 // fixed graceful shutdown timeout on the server.
 func WithGracefulShutdownTimeout(timeout time.Duration) Option {
 	return WithGracefulShutdownHandler(NewGracefulShutdownTimeoutHandler(timeout))
+}
+
+// WithErrorHandler returns a functional option that sets the central handler
+// for operational server and handler errors.
+func WithErrorHandler(handler ErrorHandler) Option {
+	return func(srv *Server) error {
+		srv.ErrorHandler = handler
+		return nil
+	}
 }
 
 // PasswordAuth returns a functional option that sets PasswordHandler on the server.
@@ -52,7 +61,7 @@ func PublicKeyAuth(fn PublicKeyHandler) Option {
 // from a PEM file at filepath.
 func HostKeyFile(filepath string) Option {
 	return func(srv *Server) error {
-		pemBytes, err := os.ReadFile(filepath)
+		pemBytes, err := os.ReadFile(filepath) // #nosec G304 -- callers intentionally choose the host-key path
 		if err != nil {
 			return err
 		}
@@ -94,8 +103,8 @@ func HostKeyPEM(bytes []byte) Option {
 // denying PTY requests.
 func NoPty() Option {
 	return func(srv *Server) error {
-		srv.PtyCallback = func(ctx Context, pty Pty) bool {
-			return false
+		srv.PtyCallback = func(Context, Session, Pty) (bool, error) {
+			return false, nil
 		}
 		return nil
 	}

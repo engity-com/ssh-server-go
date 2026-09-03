@@ -8,6 +8,7 @@ import (
 	"io"
 	"maps"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,8 +17,7 @@ import (
 )
 
 func (srv *Server) serveOnce(l net.Listener) error {
-	srv.ensureHandlers()
-	if err := srv.ensureHostSigner(); err != nil {
+	if err := srv.prepare(context.Background()); err != nil {
 		return err
 	}
 	conn, e := l.Accept()
@@ -88,10 +88,11 @@ func TestStdout(t *testing.T) {
 	t.Parallel()
 	testBytes := []byte("Hello world\n")
 	session, _, cleanup := newTestSession(t, &Server{
-		Handler: func(s Session) {
+		Handler: func(s Session) error {
 			if _, err := s.Write(testBytes); err != nil {
 				t.Error(err)
 			}
+			return nil
 		},
 	}, nil)
 	defer cleanup()
@@ -109,10 +110,11 @@ func TestStderr(t *testing.T) {
 	t.Parallel()
 	testBytes := []byte("Hello world\n")
 	session, _, cleanup := newTestSession(t, &Server{
-		Handler: func(s Session) {
+		Handler: func(s Session) error {
 			if _, err := s.Stderr().Write(testBytes); err != nil {
 				t.Error(err)
 			}
+			return nil
 		},
 	}, nil)
 	defer cleanup()
@@ -130,8 +132,9 @@ func TestStdin(t *testing.T) {
 	t.Parallel()
 	testBytes := []byte("Hello world\n")
 	session, _, cleanup := newTestSession(t, &Server{
-		Handler: func(s Session) {
-			_, _ = io.Copy(s, s) // stdin back into stdout
+		Handler: func(s Session) error {
+			_, _ = io.Copy(s, s)
+			return nil // stdin back into stdout
 		},
 	}, nil)
 	defer cleanup()
@@ -150,10 +153,11 @@ func TestUser(t *testing.T) {
 	t.Parallel()
 	testUser := []byte("a_great_user")
 	session, _, cleanup := newTestSession(t, &Server{
-		Handler: func(s Session) {
+		Handler: func(s Session) error {
 			if _, err := io.WriteString(s, s.User()); err != nil {
 				t.Error(err)
 			}
+			return nil
 		},
 	}, &gossh.ClientConfig{
 		User: string(testUser),
@@ -172,7 +176,8 @@ func TestUser(t *testing.T) {
 func TestDefaultExitStatusZero(t *testing.T) {
 	t.Parallel()
 	session, _, cleanup := newTestSession(t, &Server{
-		Handler: func(s Session) {
+		Handler: func(s Session) error {
+			return nil
 			// noop
 		},
 	}, nil)
@@ -186,10 +191,11 @@ func TestDefaultExitStatusZero(t *testing.T) {
 func TestExplicitExitStatusZero(t *testing.T) {
 	t.Parallel()
 	session, _, cleanup := newTestSession(t, &Server{
-		Handler: func(s Session) {
+		Handler: func(s Session) error {
 			if err := s.Exit(0); err != nil {
 				t.Error(err)
 			}
+			return nil
 		},
 	}, nil)
 	defer cleanup()
@@ -202,10 +208,11 @@ func TestExplicitExitStatusZero(t *testing.T) {
 func TestExitStatusNonZero(t *testing.T) {
 	t.Parallel()
 	session, _, cleanup := newTestSession(t, &Server{
-		Handler: func(s Session) {
+		Handler: func(s Session) error {
 			if err := s.Exit(1); err != nil {
 				t.Error(err)
 			}
+			return nil
 		},
 	}, nil)
 	defer cleanup()
@@ -234,13 +241,14 @@ func TestPty(t *testing.T) {
 	}
 	result := make(chan handlerResult, 1)
 	session, _, cleanup := newTestSession(t, &Server{
-		PtyCallback: func(_ Context, pty Pty) bool {
+		PtyCallback: func(_ Context, _ Session, pty Pty) (bool, error) {
 			pty.TerminalModes[gossh.ECHO] = 0
-			return true
+			return true, nil
 		},
-		Handler: func(s Session) {
+		Handler: func(s Session) error {
 			ptyReq, _, isPty := s.Pty()
 			result <- handlerResult{pty: ptyReq, isPty: isPty}
+			return nil
 		},
 	}, nil)
 	defer cleanup()
@@ -280,10 +288,11 @@ func TestPtyTerminalModesAreMetadataOnly(t *testing.T) {
 	}
 	run := func(modes gossh.TerminalModes) string {
 		result := make(chan handlerResult, 1)
-		session, _, cleanup := newTestSession(t, &Server{Handler: func(s Session) {
+		session, _, cleanup := newTestSession(t, &Server{Handler: func(s Session) error {
 			pty, _, ok := s.Pty()
 			_, err := io.WriteString(s, "line\n")
 			result <- handlerResult{pty: pty, ok: ok, err: err}
+			return nil
 		}}, nil)
 		defer cleanup()
 
@@ -307,10 +316,10 @@ func TestPtyTerminalModesAreMetadataOnly(t *testing.T) {
 func TestPtyRejectsMalformedTerminalModesBeforeCallback(t *testing.T) {
 	callbackCalled := make(chan struct{}, 1)
 	session, _, cleanup := newTestSession(t, &Server{
-		Handler: func(Session) {},
-		PtyCallback: func(Context, Pty) bool {
+		Handler: func(Session) error { return nil },
+		PtyCallback: func(Context, Session, Pty) (bool, error) {
 			callbackCalled <- struct{}{}
-			return true
+			return true, nil
 		},
 	}, nil)
 	defer cleanup()
@@ -333,7 +342,7 @@ func TestPtyResize(t *testing.T) {
 	winches := make(chan Window)
 	done := make(chan bool)
 	session, _, cleanup := newTestSession(t, &Server{
-		Handler: func(s Session) {
+		Handler: func(s Session) error {
 			ptyReq, winCh, isPty := s.Pty()
 			if !isPty {
 				t.Fatalf("expected pty but none requested")
@@ -345,6 +354,7 @@ func TestPtyResize(t *testing.T) {
 				winches <- win
 			}
 			close(done)
+			return nil
 		},
 	}, nil)
 	defer cleanup()
@@ -380,11 +390,12 @@ func TestPtyResize(t *testing.T) {
 func TestPtyResizeCoalescesWithoutConsumer(t *testing.T) {
 	serverSession := make(chan Session, 1)
 	windowChanges := make(chan (<-chan Window), 1)
-	session, _, cleanup := newTestSession(t, &Server{Handler: func(s Session) {
+	session, _, cleanup := newTestSession(t, &Server{Handler: func(s Session) error {
 		_, winch, _ := s.Pty()
 		serverSession <- s
 		windowChanges <- winch
 		<-s.Context().Done()
+		return nil
 	}}, nil)
 	defer cleanup()
 	require.NoError(t, session.RequestPty("xterm", 80, 40, gossh.TerminalModes{}))
@@ -426,12 +437,12 @@ func TestPtyResizeCoalescesWithoutConsumer(t *testing.T) {
 
 func TestPtyCanBeReadWhileWindowChanges(t *testing.T) {
 	started := make(chan struct{})
-	session, _, cleanup := newTestSession(t, &Server{Handler: func(s Session) {
+	session, _, cleanup := newTestSession(t, &Server{Handler: func(s Session) error {
 		close(started)
 		for {
 			select {
 			case <-s.Context().Done():
-				return
+				return nil
 			default:
 				s.Pty()
 			}
@@ -485,10 +496,11 @@ func TestClosedSignalChannelPreservesBufferedSignals(t *testing.T) {
 func TestSignalRequestsReceiveReplies(t *testing.T) {
 	ready := make(chan struct{})
 	release := make(chan struct{})
-	session, _, cleanup := newTestSession(t, &Server{Handler: func(s Session) {
+	session, _, cleanup := newTestSession(t, &Server{Handler: func(s Session) error {
 		s.Signals(make(chan Signal, 1))
 		close(ready)
 		<-release
+		return nil
 	}}, nil)
 	defer cleanup()
 	runResult := make(chan error, 1)
@@ -509,11 +521,12 @@ func TestHandlerExitCancelsBlockedSignalDelivery(t *testing.T) {
 	ready := make(chan struct{})
 	release := make(chan struct{})
 	serverSession := make(chan *session, 1)
-	session, _, cleanup := newTestSession(t, &Server{Handler: func(s Session) {
+	session, _, cleanup := newTestSession(t, &Server{Handler: func(s Session) error {
 		s.Signals(make(chan Signal))
 		serverSession <- s.(*session)
 		close(ready)
 		<-release
+		return nil
 	}}, nil)
 	defer cleanup()
 	runResult := make(chan error, 1)
@@ -543,11 +556,12 @@ func TestHandlerExitCancelsBlockedSignalDelivery(t *testing.T) {
 
 func TestDeliveredSignalReplyPrecedesHandlerExit(t *testing.T) {
 	ready := make(chan struct{})
-	session, _, cleanup := newTestSession(t, &Server{Handler: func(s Session) {
+	session, _, cleanup := newTestSession(t, &Server{Handler: func(s Session) error {
 		signals := make(chan Signal)
 		s.Signals(signals)
 		close(ready)
 		<-signals
+		return nil
 	}}, nil)
 	defer cleanup()
 	runResult := make(chan error, 1)
@@ -573,12 +587,13 @@ func TestSignalsCannotBeRegisteredAfterExitStarts(t *testing.T) {
 func TestClosedSignalChannelRejectsRequestWithoutPanic(t *testing.T) {
 	ready := make(chan struct{})
 	release := make(chan struct{})
-	session, _, cleanup := newTestSession(t, &Server{Handler: func(s Session) {
+	session, _, cleanup := newTestSession(t, &Server{Handler: func(s Session) error {
 		signals := make(chan Signal)
 		s.Signals(signals)
 		close(signals)
 		close(ready)
 		<-release
+		return nil
 	}}, nil)
 	defer cleanup()
 	runResult := make(chan error, 1)
@@ -612,12 +627,13 @@ func TestBreakUnregisterStopsDelivery(t *testing.T) {
 func TestClosedBreakChannelRejectsRequestWithoutPanic(t *testing.T) {
 	ready := make(chan struct{})
 	release := make(chan struct{})
-	session, _, cleanup := newTestSession(t, &Server{Handler: func(s Session) {
+	session, _, cleanup := newTestSession(t, &Server{Handler: func(s Session) error {
 		breaks := make(chan bool)
 		s.Break(breaks)
 		close(breaks)
 		close(ready)
 		<-release
+		return nil
 	}}, nil)
 	defer cleanup()
 	runResult := make(chan error, 1)
@@ -631,7 +647,7 @@ func TestClosedBreakChannelRejectsRequestWithoutPanic(t *testing.T) {
 }
 
 func TestSessionEnvironmentIsLimited(t *testing.T) {
-	session, _, cleanup := newTestSession(t, &Server{Handler: func(Session) {}}, nil)
+	session, _, cleanup := newTestSession(t, &Server{Handler: func(Session) error { return nil }}, nil)
 	defer cleanup()
 	for i := range maxSessionEnvVariables {
 		require.NoError(t, session.Setenv(fmt.Sprintf("KEY_%d", i), "value"))
@@ -641,10 +657,11 @@ func TestSessionEnvironmentIsLimited(t *testing.T) {
 
 func TestRejectedSubsystemDoesNotLeakIntoShell(t *testing.T) {
 	session, _, cleanup := newTestSession(t, &Server{
-		Handler: func(s Session) {
+		Handler: func(s Session) error {
 			_, _ = io.WriteString(s, s.Subsystem())
+			return nil
 		},
-		SessionRequestCallback: func(_ Session, requestType string) bool { return requestType != "subsystem" },
+		SessionRequestCallback: func(_ Session, requestType string) (bool, error) { return requestType != "subsystem", nil },
 	}, nil)
 	defer cleanup()
 	var stdout bytes.Buffer
@@ -655,8 +672,9 @@ func TestRejectedSubsystemDoesNotLeakIntoShell(t *testing.T) {
 }
 
 func TestUnknownSubsystemDoesNotLeakIntoShell(t *testing.T) {
-	session, _, cleanup := newTestSession(t, &Server{Handler: func(s Session) {
+	session, _, cleanup := newTestSession(t, &Server{Handler: func(s Session) error {
 		_, _ = io.WriteString(s, s.Subsystem())
+		return nil
 	}}, nil)
 	defer cleanup()
 	var stdout bytes.Buffer
@@ -697,7 +715,7 @@ func TestSessionPermissionsReturnsIndependentCopy(t *testing.T) {
 }
 
 func TestDefaultMaxSessionsPerConnection(t *testing.T) {
-	first, client, cleanup := newTestSession(t, &Server{Handler: func(Session) {}}, nil)
+	first, client, cleanup := newTestSession(t, &Server{Handler: func(Session) error { return nil }}, nil)
 	defer cleanup()
 	sessions := []*gossh.Session{first}
 	defer func() {
@@ -717,7 +735,7 @@ func TestDefaultMaxSessionsPerConnection(t *testing.T) {
 func TestMaxSessionsCanBeDisabled(t *testing.T) {
 	disabled := 0
 	first, client, cleanup := newTestSession(t, &Server{
-		Handler:                  func(Session) {},
+		Handler:                  func(Session) error { return nil },
 		MaxSessionsPerConnection: &disabled,
 	}, nil)
 	defer cleanup()
@@ -738,7 +756,7 @@ func TestMaxChannelsPerConnection(t *testing.T) {
 	maxChannels := 1
 	disabledSessions := 0
 	first, client, cleanup := newTestSession(t, &Server{
-		Handler:                  func(Session) {},
+		Handler:                  func(Session) error { return nil },
 		MaxSessionsPerConnection: &disabledSessions,
 		MaxChannelsPerConnection: &maxChannels,
 	}, nil)
@@ -754,6 +772,23 @@ func TestMaxChannelsPerConnection(t *testing.T) {
 		return err == nil
 	}, time.Second, time.Millisecond)
 	closeQuietly(second)
+}
+
+func TestSessionRequestTimeoutClosesIdleSession(t *testing.T) {
+	timeout := 20 * time.Millisecond
+	session, client, cleanup := newTestSession(t, &Server{
+		Handler:               func(Session) error { return nil },
+		SessionRequestTimeout: &timeout,
+	}, nil)
+	defer cleanup()
+
+	payload := gossh.Marshal(struct{ Key, Value string }{Key: "name", Value: "value"})
+	require.Eventually(t, func() bool {
+		_, err := session.SendRequest("env", true, payload)
+		return err != nil
+	}, time.Second, 10*time.Millisecond)
+	_, err := client.NewSession()
+	require.Error(t, err, "session timeout must close the SSH connection, not only one channel")
 }
 
 func TestSessionLimitsRemainReservedUntilHandlerReturns(t *testing.T) {
@@ -789,9 +824,10 @@ func TestSessionLimitsRemainReservedUntilHandlerReturns(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			started := make(chan struct{})
 			release := make(chan struct{})
-			first, client, cleanup := newTestSession(t, tc.server(func(Session) {
+			first, client, cleanup := newTestSession(t, tc.server(func(Session) error {
 				close(started)
 				<-release
+				return nil
 			}), nil)
 			defer cleanup()
 			require.NoError(t, first.Shell())
@@ -829,7 +865,7 @@ func TestSignals(t *testing.T) {
 	doneChan := make(chan interface{})
 
 	session, _, cleanup := newTestSession(t, &Server{
-		Handler: func(s Session) {
+		Handler: func(s Session) error {
 			// We need to use a buffered channel here, otherwise it's possible for the
 			// second call to Signal to get discarded.
 			signals := make(chan Signal, 2)
@@ -839,23 +875,24 @@ func TestSignals(t *testing.T) {
 			case sig := <-signals:
 				if sig != SIGINT {
 					errChan <- fmt.Errorf("expected signal %v but got %v", SIGINT, sig)
-					return
+					return nil
 				}
 			case <-doneChan:
 				errChan <- fmt.Errorf("unexpected done")
-				return
+				return nil
 			}
 
 			select {
 			case sig := <-signals:
 				if sig != SIGKILL {
 					errChan <- fmt.Errorf("expected signal %v but got %v", SIGKILL, sig)
-					return
+					return nil
 				}
 			case <-doneChan:
 				errChan <- fmt.Errorf("unexpected done")
-				return
+				return nil
 			}
+			return nil
 		},
 	}, nil)
 	defer cleanup()
@@ -882,6 +919,16 @@ func TestSignals(t *testing.T) {
 	}
 }
 
+func TestOversizedSignalIsRejected(t *testing.T) {
+	session, _, cleanup := newTestSession(t, &Server{}, nil)
+	defer cleanup()
+
+	payload := gossh.Marshal(&struct{ Signal string }{Signal: strings.Repeat("A", maxSessionSignalBytes+1)})
+	accepted, err := session.SendRequest("signal", true, payload)
+	require.NoError(t, err)
+	require.False(t, accepted)
+}
+
 func TestBreakWithChanRegistered(t *testing.T) {
 	t.Parallel()
 
@@ -896,7 +943,7 @@ func TestBreakWithChanRegistered(t *testing.T) {
 	readyToReceiveBreak := make(chan bool)
 
 	session, _, cleanup := newTestSession(t, &Server{
-		Handler: func(s Session) {
+		Handler: func(s Session) error {
 			s.Break(breakChan) // register a break channel with the session
 			readyToReceiveBreak <- true
 
@@ -904,12 +951,13 @@ func TestBreakWithChanRegistered(t *testing.T) {
 			case <-breakChan:
 				if _, err := io.WriteString(s, "break"); err != nil {
 					errChan <- err
-					return
+					return nil
 				}
 			case <-doneChan:
 				errChan <- fmt.Errorf("unexpected done")
-				return
+				return nil
 			}
+			return nil
 		},
 	}, nil)
 	defer cleanup()
@@ -951,8 +999,9 @@ func TestBreakWithoutChanRegistered(t *testing.T) {
 	waitUntilAfterBreakSent := make(chan bool)
 
 	session, _, cleanup := newTestSession(t, &Server{
-		Handler: func(s Session) {
+		Handler: func(s Session) error {
 			<-waitUntilAfterBreakSent
+			return nil
 		},
 	}, nil)
 	defer cleanup()
@@ -982,11 +1031,12 @@ func TestHandlerExitCancelsBlockedBreakDelivery(t *testing.T) {
 	ready := make(chan struct{})
 	release := make(chan struct{})
 	serverSession := make(chan *session, 1)
-	session, _, cleanup := newTestSession(t, &Server{Handler: func(s Session) {
+	session, _, cleanup := newTestSession(t, &Server{Handler: func(s Session) error {
 		s.Break(make(chan bool))
 		serverSession <- s.(*session)
 		close(ready)
 		<-release
+		return nil
 	}}, nil)
 	defer cleanup()
 	runResult := make(chan error, 1)

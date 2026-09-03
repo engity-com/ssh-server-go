@@ -88,8 +88,8 @@ func TestDirectStreamLocalForwarding(t *testing.T) {
 	defer closeQuietly(peer)
 	callbackPath := make(chan string, 1)
 	_, client, cleanup := newTestSession(t, &Server{
-		Handler: func(Session) {},
-		LocalUnixForwardingCallback: func(_ Context, path string) (net.Conn, error) {
+		Handler: func(Session) error { return nil },
+		LocalUnixForwardingCallback: func(_ Context, _ gossh.ConnMetadata, path string) (net.Conn, error) {
 			callbackPath <- path
 			return forward, nil
 		},
@@ -135,22 +135,22 @@ func TestDirectStreamLocalForwardingRejectsAndHidesErrors(t *testing.T) {
 			message: "unix forwarding is disabled",
 		},
 		"denied": {
-			callback: func(Context, string) (net.Conn, error) { return nil, ErrServerPermissionDenied },
+			callback: func(Context, gossh.ConnMetadata, string) (net.Conn, error) { return nil, ErrServerPermissionDenied },
 			message:  "unix forwarding is denied",
 		},
 		"failed": {
-			callback: func(Context, string) (net.Conn, error) { return nil, errors.New(secret) },
+			callback: func(Context, gossh.ConnMetadata, string) (net.Conn, error) { return nil, errors.New(secret) },
 			message:  "connection failed",
 		},
 		"nil connection": {
-			callback: func(Context, string) (net.Conn, error) { return nil, nil },
+			callback: func(Context, gossh.ConnMetadata, string) (net.Conn, error) { return nil, nil },
 			message:  "connection failed",
 		},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			_, client, cleanup := newTestSession(t, &Server{
-				Handler:                     func(Session) {},
+				Handler:                     func(Session) error { return nil },
 				LocalUnixForwardingCallback: tt.callback,
 			}, nil)
 			defer cleanup()
@@ -166,8 +166,8 @@ func TestDirectStreamLocalForwardingRejectsAndHidesErrors(t *testing.T) {
 func TestDirectStreamLocalRejectsMalformedPayloadBeforeCallback(t *testing.T) {
 	var callbackCalls atomic.Int64
 	_, client, cleanup := newTestSession(t, &Server{
-		Handler: func(Session) {},
-		LocalUnixForwardingCallback: func(Context, string) (net.Conn, error) {
+		Handler: func(Session) error { return nil },
+		LocalUnixForwardingCallback: func(Context, gossh.ConnMetadata, string) (net.Conn, error) {
 			callbackCalls.Add(1)
 			return nil, nil
 		},
@@ -185,8 +185,8 @@ func TestReverseStreamLocalForwardingAndCancel(t *testing.T) {
 	callbackPath := make(chan string, 1)
 	handler := &ForwardedUnixHandler{}
 	_, client, cleanup := newTestSession(t, &Server{
-		Handler: func(Session) {},
-		ReverseUnixForwardingCallback: func(_ Context, path string) (net.Listener, error) {
+		Handler: func(Session) error { return nil },
+		ReverseUnixForwardingCallback: func(_ Context, _ gossh.ConnMetadata, path string) (net.Listener, error) {
 			callbackPath <- path
 			return serverListener, nil
 		},
@@ -224,8 +224,8 @@ func TestReverseStreamLocalWaitsForSuccessfulReply(t *testing.T) {
 	defer closeQuietly(serverConn)
 	handler := &ForwardedUnixHandler{}
 	_, client, cleanup := newTestSession(t, &Server{
-		Handler: func(Session) {},
-		ReverseUnixForwardingCallback: func(Context, string) (net.Listener, error) {
+		Handler: func(Session) error { return nil },
+		ReverseUnixForwardingCallback: func(Context, gossh.ConnMetadata, string) (net.Listener, error) {
 			return serverListener, nil
 		},
 		RequestHandlers: streamLocalRequestHandlers(handler),
@@ -242,13 +242,13 @@ func TestReverseStreamLocalWaitsForSuccessfulReply(t *testing.T) {
 
 func TestReverseStreamLocalForwardingRejectsCallbackErrors(t *testing.T) {
 	tests := map[string]ReverseUnixForwardingCallback{
-		"denied": func(Context, string) (net.Listener, error) {
+		"denied": func(Context, gossh.ConnMetadata, string) (net.Listener, error) {
 			return nil, ErrServerPermissionDenied
 		},
-		"failed": func(Context, string) (net.Listener, error) {
+		"failed": func(Context, gossh.ConnMetadata, string) (net.Listener, error) {
 			return nil, errors.New("private listener detail")
 		},
-		"nil listener": func(Context, string) (net.Listener, error) {
+		"nil listener": func(Context, gossh.ConnMetadata, string) (net.Listener, error) {
 			return nil, nil
 		},
 	}
@@ -256,7 +256,7 @@ func TestReverseStreamLocalForwardingRejectsCallbackErrors(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			handler := &ForwardedUnixHandler{}
 			_, client, cleanup := newTestSession(t, &Server{
-				Handler:                       func(Session) {},
+				Handler:                       func(Session) error { return nil },
 				ReverseUnixForwardingCallback: callback,
 				RequestHandlers:               streamLocalRequestHandlers(handler),
 			}, nil)
@@ -277,8 +277,8 @@ func TestReverseStreamLocalForwardingIsConnectionScoped(t *testing.T) {
 	listeners := make(chan *streamLocalTestListener, 2)
 	newServer := func() (*gossh.Client, func()) {
 		_, client, cleanup := newTestSession(t, &Server{
-			Handler: func(Session) {},
-			ReverseUnixForwardingCallback: func(Context, string) (net.Listener, error) {
+			Handler: func(Session) error { return nil },
+			ReverseUnixForwardingCallback: func(Context, gossh.ConnMetadata, string) (net.Listener, error) {
 				listener := newStreamLocalTestListener()
 				listeners <- listener
 				return listener, nil
@@ -320,8 +320,8 @@ func TestReverseStreamLocalRejectsDuplicatePathOnSameConnection(t *testing.T) {
 	var callbackCalls atomic.Int64
 	handler := &ForwardedUnixHandler{}
 	_, client, cleanup := newTestSession(t, &Server{
-		Handler: func(Session) {},
-		ReverseUnixForwardingCallback: func(Context, string) (net.Listener, error) {
+		Handler: func(Session) error { return nil },
+		ReverseUnixForwardingCallback: func(Context, gossh.ConnMetadata, string) (net.Listener, error) {
 			callbackCalls.Add(1)
 			return newStreamLocalTestListener(), nil
 		},
@@ -348,14 +348,14 @@ func TestReverseStreamLocalCancelStopsPendingOpenBeforePathReuse(t *testing.T) {
 	release := func() { releaseOnce.Do(func() { close(releaseCancel) }) }
 	defer release()
 	requestHandlers := streamLocalRequestHandlers(handler)
-	requestHandlers["cancel-streamlocal-forward@openssh.com"] = func(ctx Context, srv *Server, req *gossh.Request) (bool, []byte) {
+	requestHandlers["cancel-streamlocal-forward@openssh.com"] = func(response RequestResponseWriter, request *Request) error {
 		cancelOnce.Do(func() { close(cancelReceived) })
 		<-releaseCancel
-		return handler.HandleSSHRequest(ctx, srv, req)
+		return handler.HandleSSHRequest(response, request)
 	}
 	_, client, cleanup := newTestSession(t, &Server{
-		Handler: func(Session) {},
-		ReverseUnixForwardingCallback: func(Context, string) (net.Listener, error) {
+		Handler: func(Session) error { return nil },
+		ReverseUnixForwardingCallback: func(Context, gossh.ConnMetadata, string) (net.Listener, error) {
 			listener := newStreamLocalTestListener()
 			listeners <- listener
 			return listener, nil
@@ -418,10 +418,10 @@ func TestReverseStreamLocalAndTCPShareForwardLimit(t *testing.T) {
 	requestHandlers["tcpip-forward"] = tcpHandler.HandleSSHRequest
 	requestHandlers["cancel-tcpip-forward"] = tcpHandler.HandleSSHRequest
 	_, client, cleanup := newTestSession(t, &Server{
-		Handler:                         func(Session) {},
+		Handler:                         func(Session) error { return nil },
 		MaxReverseForwardsPerConnection: &maxForwards,
-		ReversePortForwardingCallback:   func(Context, string, uint32) bool { return true },
-		ReverseUnixForwardingCallback: func(Context, string) (net.Listener, error) {
+		ReversePortForwardingCallback:   func(Context, gossh.ConnMetadata, string, uint32) (bool, error) { return true, nil },
+		ReverseUnixForwardingCallback: func(Context, gossh.ConnMetadata, string) (net.Listener, error) {
 			unixCallbackCalls.Add(1)
 			return newStreamLocalTestListener(), nil
 		},
@@ -450,9 +450,9 @@ func TestReverseStreamLocalRespectsChannelLimit(t *testing.T) {
 	serverListener := newStreamLocalTestListener()
 	handler := &ForwardedUnixHandler{}
 	_, client, cleanup := newTestSession(t, &Server{
-		Handler:                  func(Session) {},
+		Handler:                  func(Session) error { return nil },
 		MaxChannelsPerConnection: &maxChannels,
-		ReverseUnixForwardingCallback: func(Context, string) (net.Listener, error) {
+		ReverseUnixForwardingCallback: func(Context, gossh.ConnMetadata, string) (net.Listener, error) {
 			return serverListener, nil
 		},
 		RequestHandlers: streamLocalRequestHandlers(handler),
@@ -482,17 +482,18 @@ func TestReverseStreamLocalListenerClosesBeforeDisconnectCallback(t *testing.T) 
 	disconnected := make(chan bool, 1)
 	handler := &ForwardedUnixHandler{}
 	session, client, cleanup := newTestSession(t, &Server{
-		Handler: func(Session) {},
-		ReverseUnixForwardingCallback: func(Context, string) (net.Listener, error) {
+		Handler: func(Session) error { return nil },
+		ReverseUnixForwardingCallback: func(Context, gossh.ConnMetadata, string) (net.Listener, error) {
 			return serverListener, nil
 		},
-		DisconnectCallback: func(Context, net.Conn) {
+		DisconnectCallback: func(Context, net.Conn) error {
 			select {
 			case <-serverListener.closed:
 				disconnected <- true
 			default:
 				disconnected <- false
 			}
+			return nil
 		},
 		RequestHandlers: streamLocalRequestHandlers(handler),
 	}, nil)
@@ -511,42 +512,13 @@ func TestReverseStreamLocalListenerClosesBeforeDisconnectCallback(t *testing.T) 
 	}
 }
 
-func TestUnixForwardingCallbacksAreSnapshotted(t *testing.T) {
-	localCalls := make(chan string, 1)
-	reverseCalls := make(chan string, 1)
-	srv := &Server{
-		LocalUnixForwardingCallback: func(_ Context, path string) (net.Conn, error) {
-			localCalls <- path
-			left, right := net.Pipe()
-			closeQuietly(right)
-			return left, nil
-		},
-		ReverseUnixForwardingCallback: func(_ Context, path string) (net.Listener, error) {
-			reverseCalls <- path
-			return newStreamLocalTestListener(), nil
-		},
-	}
-	settings := srv.connectionSettings()
-	srv.LocalUnixForwardingCallback = nil
-	srv.ReverseUnixForwardingCallback = nil
-
-	conn, err := settings.localUnixForwardingCallback(nil, "local")
-	require.NoError(t, err)
-	closeQuietly(conn)
-	listener, err := settings.reverseUnixForwardingCallback(nil, "reverse")
-	require.NoError(t, err)
-	closeQuietly(listener)
-	require.Equal(t, "local", <-localCalls)
-	require.Equal(t, "reverse", <-reverseCalls)
-}
-
 func TestUnixForwardingCallbackRetainsResultsOnError(t *testing.T) {
 	forward, peer := net.Pipe()
 	defer closeQuietly(forward)
 	defer closeQuietly(peer)
 	_, client, cleanup := newTestSession(t, &Server{
-		Handler: func(Session) {},
-		LocalUnixForwardingCallback: func(Context, string) (net.Conn, error) {
+		Handler: func(Session) error { return nil },
+		LocalUnixForwardingCallback: func(Context, gossh.ConnMetadata, string) (net.Conn, error) {
 			return forward, ErrServerPermissionDenied
 		},
 	}, nil)
@@ -563,8 +535,8 @@ func TestUnixForwardingCallbackRetainsResultsOnError(t *testing.T) {
 	defer closeQuietly(listener)
 	handler := &ForwardedUnixHandler{}
 	_, reverseClient, reverseCleanup := newTestSession(t, &Server{
-		Handler: func(Session) {},
-		ReverseUnixForwardingCallback: func(Context, string) (net.Listener, error) {
+		Handler: func(Session) error { return nil },
+		ReverseUnixForwardingCallback: func(Context, gossh.ConnMetadata, string) (net.Listener, error) {
 			return listener, ErrServerPermissionDenied
 		},
 		RequestHandlers: streamLocalRequestHandlers(handler),
@@ -654,7 +626,7 @@ func TestStreamLocalWirePayloads(t *testing.T) {
 }
 
 func TestStreamLocalForwardRegistrationRaceError(t *testing.T) {
-	require.True(t, isStreamLocalForwardRegistrationRace(&gossh.OpenChannelError{
+	require.True(t, isForwardRegistrationRace(&gossh.OpenChannelError{
 		Reason:  gossh.Prohibited,
 		Message: "no forward for address",
 	}))
@@ -664,7 +636,7 @@ func TestStreamLocalForwardRegistrationRaceError(t *testing.T) {
 		&gossh.OpenChannelError{Reason: gossh.UnknownChannelType, Message: "no forward for address"},
 		&gossh.OpenChannelError{Reason: gossh.Prohibited, Message: "different rejection"},
 	} {
-		require.False(t, isStreamLocalForwardRegistrationRace(err))
+		require.False(t, isForwardRegistrationRace(err))
 	}
 }
 
@@ -672,8 +644,8 @@ func TestReverseStreamLocalRejectsMalformedPayloadBeforeCallback(t *testing.T) {
 	handler := &ForwardedUnixHandler{}
 	var callbackCalls atomic.Int64
 	_, client, cleanup := newTestSession(t, &Server{
-		Handler: func(Session) {},
-		ReverseUnixForwardingCallback: func(Context, string) (net.Listener, error) {
+		Handler: func(Session) error { return nil },
+		ReverseUnixForwardingCallback: func(Context, gossh.ConnMetadata, string) (net.Listener, error) {
 			callbackCalls.Add(1)
 			return nil, nil
 		},

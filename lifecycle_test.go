@@ -19,14 +19,15 @@ func TestServeGracefullyDrainsResourcesWithoutWaitingForHandler(t *testing.T) {
 	releaseHandler := make(chan struct{})
 	var gracefulCalls atomic.Int32
 	srv := &Server{
-		GracefulShutdownHandler: func(ctx context.Context) time.Duration {
+		GracefulShutdownHandler: func(ctx context.Context) (time.Duration, error) {
 			gracefulCalls.Add(1)
 			require.ErrorIs(t, context.Cause(ctx), context.Canceled)
-			return time.Second
+			return time.Second, nil
 		},
-		Handler: func(session Session) {
+		Handler: func(session Session) error {
 			handlerStarted <- session.Context()
 			<-releaseHandler
+			return nil
 		},
 	}
 	listener := newLocalListener()
@@ -71,13 +72,18 @@ func TestServeGracefullyDrainsResourcesWithoutWaitingForHandler(t *testing.T) {
 func TestServeGracefulTimeoutForcesConnection(t *testing.T) {
 	expected := errors.New("stop requested")
 	period := 20 * time.Millisecond
+	connectionEntered := make(chan struct{})
 	var gracefulCalls atomic.Int32
 	var callbackContext context.Context
 	srv := &Server{
-		GracefulShutdownHandler: func(ctx context.Context) time.Duration {
+		ConnCallback: func(_ Context, conn net.Conn) (net.Conn, error) {
+			close(connectionEntered)
+			return conn, nil
+		},
+		GracefulShutdownHandler: func(ctx context.Context) (time.Duration, error) {
 			gracefulCalls.Add(1)
 			callbackContext = ctx
-			return period
+			return period, nil
 		},
 	}
 	listener := newLocalListener()
@@ -88,9 +94,7 @@ func TestServeGracefulTimeoutForcesConnection(t *testing.T) {
 	conn, err := net.Dial("tcp", listener.Addr().String())
 	require.NoError(t, err)
 	defer closeQuietly(conn)
-	require.Eventually(t, func() bool {
-		return activeConnectionCount(srv) == 1
-	}, time.Second, time.Millisecond)
+	<-connectionEntered
 
 	started := time.Now()
 	cancel(expected)
@@ -100,10 +104,6 @@ func TestServeGracefulTimeoutForcesConnection(t *testing.T) {
 	require.GreaterOrEqual(t, time.Since(started), period)
 	require.Equal(t, ctx, callbackContext)
 	require.Equal(t, int32(1), gracefulCalls.Load())
-	require.Zero(t, activeConnectionCount(srv))
-	srv.mu.RLock()
-	require.Zero(t, srv.startups)
-	srv.mu.RUnlock()
 
 	require.NoError(t, conn.SetReadDeadline(time.Now().Add(time.Second)))
 	_, err = conn.Read(make([]byte, 1))
@@ -113,7 +113,11 @@ func TestServeGracefulTimeoutForcesConnection(t *testing.T) {
 }
 
 func TestServeScopesAreIndependentAndReusable(t *testing.T) {
-	srv := &Server{}
+	connected := make(chan struct{}, 3)
+	srv := &Server{ConnCallback: func(_ Context, conn net.Conn) (net.Conn, error) {
+		connected <- struct{}{}
+		return conn, nil
+	}}
 	firstListener := newLocalListener()
 	secondListener := newLocalListener()
 	firstCtx, cancelFirst := context.WithCancel(context.Background())
@@ -129,9 +133,8 @@ func TestServeScopesAreIndependentAndReusable(t *testing.T) {
 	secondConn, err := net.Dial("tcp", secondListener.Addr().String())
 	require.NoError(t, err)
 	defer closeQuietly(secondConn)
-	require.Eventually(t, func() bool {
-		return activeConnectionCount(srv) == 2
-	}, time.Second, time.Millisecond)
+	<-connected
+	<-connected
 
 	cancelFirst()
 	require.ErrorIs(t, <-firstDone, context.Canceled)
@@ -144,9 +147,7 @@ func TestServeScopesAreIndependentAndReusable(t *testing.T) {
 	additionalConn, err := net.Dial("tcp", secondListener.Addr().String())
 	require.NoError(t, err)
 	defer closeQuietly(additionalConn)
-	require.Eventually(t, func() bool {
-		return activeConnectionCount(srv) == 2
-	}, time.Second, time.Millisecond)
+	<-connected
 	cancelSecond()
 	require.ErrorIs(t, <-secondDone, context.Canceled)
 
@@ -157,11 +158,62 @@ func TestServeScopesAreIndependentAndReusable(t *testing.T) {
 	thirdConn, err := net.Dial("tcp", thirdListener.Addr().String())
 	require.NoError(t, err)
 	defer closeQuietly(thirdConn)
-	require.Eventually(t, func() bool {
-		return activeConnectionCount(srv) == 1
-	}, time.Second, time.Millisecond)
+	<-connected
 	cancelThird()
 	require.ErrorIs(t, <-thirdDone, context.Canceled)
+}
+
+func TestMaxStartupsIsIndependentPerServe(t *testing.T) {
+	contexts := make(chan *serveContext, 2)
+	srv := &Server{
+		MaxStartups: &MaxStartupsConfig{Start: 1, Full: 1},
+		ConnCallback: func(ctx Context, conn net.Conn) (net.Conn, error) {
+			serve, _ := ctx.Value(contextKeyServeContext).(*serveContext)
+			contexts <- serve
+			return conn, nil
+		},
+	}
+	firstListener := newLocalListener()
+	secondListener := newLocalListener()
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	secondCtx, cancelSecond := context.WithCancel(context.Background())
+	firstDone := make(chan error, 1)
+	secondDone := make(chan error, 1)
+	go func() { firstDone <- srv.Serve(firstCtx, firstListener) }()
+	go func() { secondDone <- srv.Serve(secondCtx, secondListener) }()
+
+	first, err := net.Dial("tcp", firstListener.Addr().String())
+	require.NoError(t, err)
+	defer closeQuietly(first)
+	firstServe := <-contexts
+	second, err := net.Dial("tcp", secondListener.Addr().String())
+	require.NoError(t, err)
+	defer closeQuietly(second)
+	secondServe := <-contexts
+	require.NotNil(t, firstServe)
+	require.NotNil(t, secondServe)
+	require.NotSame(t, firstServe, secondServe)
+	firstServe.mu.Lock()
+	require.Equal(t, 1, firstServe.startups)
+	firstServe.mu.Unlock()
+	secondServe.mu.Lock()
+	require.Equal(t, 1, secondServe.startups)
+	secondServe.mu.Unlock()
+
+	overflow, err := net.Dial("tcp", firstListener.Addr().String())
+	require.NoError(t, err)
+	defer closeQuietly(overflow)
+	require.NoError(t, overflow.SetReadDeadline(time.Now().Add(time.Second)))
+	_, err = overflow.Read(make([]byte, 1))
+	require.Error(t, err)
+	if netErr, ok := errors.AsType[net.Error](err); ok {
+		require.False(t, netErr.Timeout(), "connection was not rejected at the per-Serve startup limit")
+	}
+
+	cancelFirst()
+	cancelSecond()
+	require.ErrorIs(t, <-firstDone, context.Canceled)
+	require.ErrorIs(t, <-secondDone, context.Canceled)
 }
 
 func TestServeReturnsAcceptAndListenerCleanupErrors(t *testing.T) {
@@ -176,68 +228,50 @@ func TestServeReturnsAcceptAndListenerCleanupErrors(t *testing.T) {
 	require.Equal(t, int32(1), listener.closeCalls.Load())
 }
 
-func TestServeCancellationClosesListenerDuringInitialization(t *testing.T) {
-	srv := &Server{}
-	listener := &closeNotifyingListener{
-		Listener: newLocalListener(),
-		closed:   make(chan struct{}),
-	}
-	srv.configMu.Lock()
-	configLocked := true
-	defer func() {
-		if configLocked {
-			srv.configMu.Unlock()
-		}
-	}()
-	ctx, cancel := context.WithCancel(context.Background())
-	serveDone := make(chan error, 1)
-	go func() { serveDone <- srv.Serve(ctx, listener) }()
-	require.Eventually(t, func() bool {
-		srv.mu.RLock()
-		defer srv.mu.RUnlock()
-		return len(srv.scopes) == 1
-	}, time.Second, time.Millisecond)
-
-	cancel()
-	select {
-	case <-listener.closed:
-	case <-time.After(time.Second):
-		t.Fatal("context cancellation did not close the listener during initialization")
-	}
-	srv.configMu.Unlock()
-	configLocked = false
-	require.ErrorIs(t, <-serveDone, context.Canceled)
-	require.Equal(t, int32(1), listener.closeCalls.Load())
-}
-
 func TestServeInitializationFailureDoesNotCloseListenerTwice(t *testing.T) {
 	srv := &Server{RequireHostSigners: true}
 	listener := &closeNotifyingListener{
 		Listener: newLocalListener(),
 		closed:   make(chan struct{}),
 	}
-	srv.configMu.Lock()
-	configLocked := true
-	defer func() {
-		if configLocked {
-			srv.configMu.Unlock()
-		}
-	}()
-	ctx, cancel := context.WithCancel(context.Background())
-	serveDone := make(chan error, 1)
-	go func() { serveDone <- srv.Serve(ctx, listener) }()
-	require.Eventually(t, func() bool {
-		srv.mu.RLock()
-		defer srv.mu.RUnlock()
-		return len(srv.scopes) == 1
-	}, time.Second, time.Millisecond)
-
-	cancel()
+	err := srv.Serve(context.Background(), listener)
+	require.ErrorIs(t, err, ErrServerHostSignerRequired)
 	<-listener.closed
-	srv.configMu.Unlock()
-	configLocked = false
-	require.ErrorIs(t, <-serveDone, ErrServerHostSignerRequired)
 	require.Equal(t, int32(1), listener.closeCalls.Load())
+}
+
+func TestServeCancellationWhileWaitingForPreparationClosesListener(t *testing.T) {
+	srv := &Server{}
+	srv.prepareOnce.Do(func() {})
+	srv.prepareDone = make(chan struct{})
+	listener := &closeNotifyingListener{
+		Listener: newLocalListener(),
+		closed:   make(chan struct{}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	require.ErrorIs(t, srv.Serve(ctx, listener), context.Canceled)
+	select {
+	case <-listener.closed:
+	case <-time.After(time.Second):
+		t.Fatal("canceled Serve did not close its listener while preparation was pending")
+	}
+}
+
+func TestHandleConnCancellationWhileWaitingForPreparationClosesConnection(t *testing.T) {
+	srv := &Server{}
+	srv.prepareOnce.Do(func() {})
+	srv.prepareDone = make(chan struct{})
+	serverConn, clientConn := net.Pipe()
+	defer closeQuietly(clientConn)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	require.ErrorIs(t, srv.HandleConn(ctx, serverConn), context.Canceled)
+	_ = clientConn.SetReadDeadline(time.Now().Add(time.Second))
+	_, err := clientConn.Read(make([]byte, 1))
+	require.Error(t, err)
 }
 
 func TestConnectionResourceAcquisitionBlocksCleanupUntilRegistration(t *testing.T) {
@@ -282,11 +316,12 @@ func TestServeClosesRegisteredResourcesBeforeReturning(t *testing.T) {
 	resourceAddr := resourceListener.Addr().String()
 	resourceRegistered := make(chan struct{})
 	releaseHandler := make(chan struct{})
-	srv := &Server{Handler: func(session Session) {
+	srv := &Server{Handler: func(session Session) error {
 		unregister := registerConnectionResource(session.Context(), func() { closeQuietly(resourceListener) })
 		defer unregister()
 		close(resourceRegistered)
 		<-releaseHandler
+		return nil
 	}}
 	listener := newLocalListener()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -323,18 +358,19 @@ func TestHandleConnImmediateShutdownReturnsCauseAndCleanupError(t *testing.T) {
 	var gracefulCalls atomic.Int32
 	var failureCalls atomic.Int32
 	srv := &Server{
-		GracefulShutdownHandler: func(context.Context) time.Duration {
+		GracefulShutdownHandler: func(context.Context) (time.Duration, error) {
 			gracefulCalls.Add(1)
-			return -time.Second
+			return -time.Second, nil
 		},
-		ConnCallback: func(ctx Context, conn net.Conn) net.Conn {
+		ConnCallback: func(ctx Context, conn net.Conn) (net.Conn, error) {
 			callbackEntered <- ctx
 			<-releaseCallback
 			close(callbackDone)
-			return conn
+			return conn, nil
 		},
-		ConnectionFailedCallback: func(net.Conn, error) {
+		ConnectionFailedCallback: func(Context, net.Conn, error) error {
 			failureCalls.Add(1)
+			return nil
 		},
 	}
 	serverConn, clientConn := net.Pipe()
@@ -363,8 +399,6 @@ func TestHandleConnImmediateShutdownReturnsCauseAndCleanupError(t *testing.T) {
 	require.ErrorIs(t, context.Cause(connectionCtx), shutdownCause)
 	require.Equal(t, int32(1), gracefulCalls.Load())
 	require.Zero(t, failureCalls.Load())
-	require.NoError(t, srv.SetOption(NoPty()))
-
 	close(releaseCallback)
 	callbackReleased = true
 	select {

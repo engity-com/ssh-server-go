@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	gossh "golang.org/x/crypto/ssh"
 )
 
 func TestDirectStreamLocalForwardingWithUnixSocket(t *testing.T) {
@@ -28,8 +29,8 @@ func TestDirectStreamLocalForwardingWithUnixSocket(t *testing.T) {
 	}()
 
 	_, client, cleanup := newTestSession(t, &Server{
-		Handler: func(Session) {},
-		LocalUnixForwardingCallback: func(ctx Context, socketPath string) (net.Conn, error) {
+		Handler: func(Session) error { return nil },
+		LocalUnixForwardingCallback: func(ctx Context, _ gossh.ConnMetadata, socketPath string) (net.Conn, error) {
 			if socketPath != path {
 				return nil, ErrServerPermissionDenied
 			}
@@ -56,8 +57,8 @@ func TestReverseStreamLocalForwardingWithUnixSocket(t *testing.T) {
 	path := streamLocalSocketPath(t)
 	handler := &ForwardedUnixHandler{}
 	_, client, cleanup := newTestSession(t, &Server{
-		Handler: func(Session) {},
-		ReverseUnixForwardingCallback: func(_ Context, socketPath string) (net.Listener, error) {
+		Handler: func(Session) error { return nil },
+		ReverseUnixForwardingCallback: func(_ Context, _ gossh.ConnMetadata, socketPath string) (net.Listener, error) {
 			if socketPath != path {
 				return nil, ErrServerPermissionDenied
 			}

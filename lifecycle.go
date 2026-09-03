@@ -10,24 +10,29 @@ import (
 	"time"
 )
 
-type serveScope struct {
-	srv                     *Server
-	parent                  context.Context
-	listener                net.Listener
-	gracefulShutdownHandler GracefulShutdownHandler
+type serveContext struct {
+	*Server
+	parent       context.Context
+	listener     net.Listener
+	errorHandler ErrorHandler
 
-	mu                 sync.Mutex
-	connections        map[*activeConn]struct{}
-	stopping           bool
-	forced             bool
-	drained            chan struct{}
-	listenerCloseOnce  sync.Once
-	listenerCloseError error
-	stopContextWatch   func() bool
+	mu                       sync.Mutex
+	connections              map[*activeConn]struct{}
+	startups                 int
+	authenticatedConnections atomic.Int64
+	globalChannels           atomic.Int64
+	globalReverseForwards    atomic.Int64
+	errorHandlerSlots        chan struct{}
+	stopping                 bool
+	forced                   bool
+	drained                  chan struct{}
+	listenerCloseOnce        sync.Once
+	listenerCloseError       error
+	stopContextWatch         func() bool
 }
 
 type activeConn struct {
-	scope           *serveScope
+	scope           *serveContext
 	conn            net.Conn
 	transports      []net.Conn
 	cancel          context.CancelCauseFunc
@@ -39,61 +44,37 @@ type activeConn struct {
 	resources       *connectionResources
 }
 
-func newServeScope(srv *Server, parent context.Context, listener net.Listener, gracefulShutdownHandler GracefulShutdownHandler) *serveScope {
-	return &serveScope{
-		srv:                     srv,
-		parent:                  parent,
-		listener:                listener,
-		gracefulShutdownHandler: gracefulShutdownHandler,
-		connections:             make(map[*activeConn]struct{}),
-		drained:                 make(chan struct{}),
+func newServeContext(srv *Server, parent context.Context, listener net.Listener) *serveContext {
+	result := &serveContext{
+		Server:            srv,
+		parent:            parent,
+		listener:          listener,
+		connections:       make(map[*activeConn]struct{}),
+		errorHandlerSlots: make(chan struct{}, defaultMaxConcurrentErrorHandlers),
+		drained:           make(chan struct{}),
 	}
+	result.errorHandler = result.limitErrorHandler(srv.ErrorHandler)
+	return result
 }
 
-func (srv *Server) startScope(ctx context.Context, listener net.Listener) (*serveScope, error) {
-	srv.mu.Lock()
-	if srv.configuring {
-		srv.mu.Unlock()
-		return nil, errors.Join(ErrServerRunning, closeListener(listener))
+func (srv *Server) newServeContext(ctx context.Context, listener net.Listener) (*serveContext, error) {
+	if err := srv.prepare(ctx); err != nil {
+		return nil, errors.Join(err, closeListener(listener))
 	}
-	if srv.scopes == nil {
-		srv.scopes = make(map[*serveScope]struct{})
-	}
-	if srv.authenticatedConnections == nil {
-		srv.authenticatedConnections = &atomic.Int64{}
-	}
-	if srv.globalChannels == nil {
-		srv.globalChannels = &atomic.Int64{}
-	}
-	scope := newServeScope(srv, ctx, listener, srv.GracefulShutdownHandler)
-	srv.scopes[scope] = struct{}{}
-	srv.mu.Unlock()
+	scope := newServeContext(srv, ctx, listener)
 	scope.stopContextWatch = context.AfterFunc(ctx, func() {
 		_ = scope.stopAccepting()
 	})
-
-	srv.configMu.Lock()
-	srv.ensureHandlers()
-	err := srv.ensureHostSigner()
-	srv.configMu.Unlock()
-	if err != nil {
-		closeErr := scope.stopAccepting()
-		srv.finishScope(scope)
-		return nil, errors.Join(err, closeErr)
-	}
 	return scope, nil
 }
 
-func (srv *Server) finishScope(scope *serveScope) {
-	if scope.stopContextWatch != nil {
-		scope.stopContextWatch()
+func (s *serveContext) finish() {
+	if s.stopContextWatch != nil {
+		s.stopContextWatch()
 	}
-	srv.mu.Lock()
-	delete(srv.scopes, scope)
-	srv.mu.Unlock()
 }
 
-func (s *serveScope) closeListener() error {
+func (s *serveContext) closeListener() error {
 	s.listenerCloseOnce.Do(func() {
 		s.listenerCloseError = closeListener(s.listener)
 	})
@@ -110,7 +91,7 @@ func closeListener(listener net.Listener) error {
 	return nil
 }
 
-func (s *serveScope) stopAccepting() error {
+func (s *serveContext) stopAccepting() error {
 	s.mu.Lock()
 	s.stopping = true
 	s.maybeCloseDrainedLocked()
@@ -118,7 +99,7 @@ func (s *serveScope) stopAccepting() error {
 	return s.closeListener()
 }
 
-func (s *serveScope) trackConnection(conn net.Conn) *activeConn {
+func (s *serveContext) trackConnection(conn net.Conn) *activeConn {
 	s.mu.Lock()
 	if s.stopping {
 		s.mu.Unlock()
@@ -126,11 +107,11 @@ func (s *serveScope) trackConnection(conn net.Conn) *activeConn {
 		return nil
 	}
 
-	s.srv.mu.Lock()
-	maxStartups := s.srv.effectiveMaxStartups()
-	dropRate := maxStartupsDropRate(s.srv.startups, maxStartups)
-	if dropRate >= 100 || dropRate > 0 && int(rand.UintN(100)) < dropRate {
-		s.srv.mu.Unlock()
+	maxStartups := s.effectiveMaxStartups()
+	dropRate := maxStartupsDropRate(s.startups, maxStartups)
+	// The random value only spreads load shedding; authentication and access
+	// control never depend on it.
+	if dropRate >= 100 || dropRate > 0 && int(rand.UintN(100)) < dropRate { // #nosec G404
 		s.mu.Unlock()
 		closeQuietly(conn)
 		return nil
@@ -145,26 +126,25 @@ func (s *serveScope) trackConnection(conn net.Conn) *activeConn {
 		resources:       &connectionResources{},
 	}
 	if active.startupReserved {
-		s.srv.startups++
+		s.startups++
 	}
 	s.connections[active] = struct{}{}
-	s.srv.mu.Unlock()
 	s.mu.Unlock()
 	return active
 }
 
-func (s *serveScope) updateConnection(active *activeConn, conn net.Conn) bool {
+func (s *serveContext) updateConnection(active *activeConn, conn net.Conn) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.connections[active]; !ok || active.closed {
 		return false
 	}
 	active.conn = conn
-	active.transports = append(active.transports, conn)
+	active.transports = []net.Conn{conn}
 	return true
 }
 
-func (s *serveScope) updateCancel(active *activeConn, cancel context.CancelCauseFunc) bool {
+func (s *serveContext) updateCancel(active *activeConn, cancel context.CancelCauseFunc) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.connections[active]; !ok || active.closed {
@@ -174,26 +154,24 @@ func (s *serveScope) updateCancel(active *activeConn, cancel context.CancelCause
 	return true
 }
 
-func (s *serveScope) isHandshaking(active *activeConn) bool {
+func (s *serveContext) isHandshaking(active *activeConn) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return active.handshaking
 }
 
-func (s *serveScope) releaseStartup(active *activeConn) {
+func (s *serveContext) releaseStartup(active *activeConn) {
 	s.mu.Lock()
 	active.handshaking = false
 	release := active.startupReserved
 	active.startupReserved = false
-	s.mu.Unlock()
 	if release {
-		s.srv.mu.Lock()
-		s.srv.startups--
-		s.srv.mu.Unlock()
+		s.startups--
 	}
+	s.mu.Unlock()
 }
 
-func (s *serveScope) untrackConnection(active *activeConn) {
+func (s *serveContext) untrackConnection(active *activeConn) {
 	s.releaseStartup(active)
 	s.mu.Lock()
 	delete(s.connections, active)
@@ -201,13 +179,13 @@ func (s *serveScope) untrackConnection(active *activeConn) {
 	s.mu.Unlock()
 }
 
-func (s *serveScope) connectionCause(active *activeConn) error {
+func (s *serveContext) connectionCause(active *activeConn) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return active.closeCause
 }
 
-func (s *serveScope) force(cause error) error {
+func (s *serveContext) force(cause error) error {
 	listenerErr := s.stopAccepting()
 	type connectionCleanup struct {
 		cancel     context.CancelCauseFunc
@@ -237,14 +215,9 @@ func (s *serveScope) force(cause error) error {
 		})
 		delete(s.connections, active)
 	}
+	s.startups -= startupReleases
 	s.maybeCloseDrainedLocked()
 	s.mu.Unlock()
-
-	if startupReleases > 0 {
-		s.srv.mu.Lock()
-		s.srv.startups -= startupReleases
-		s.srv.mu.Unlock()
-	}
 	var result error
 	for _, cleanup := range cleanups {
 		if cleanup.cancel != nil {
@@ -260,15 +233,20 @@ func (s *serveScope) force(cause error) error {
 	return errors.Join(listenerErr, result)
 }
 
-func (s *serveScope) shutdown(ctx context.Context, handler GracefulShutdownHandler) error {
+func (s *serveContext) shutdown(ctx context.Context) error {
 	cause := context.Cause(ctx)
 	if cause == nil {
 		cause = context.Canceled
 	}
 	listenerErr := s.stopAccepting()
 	period := time.Duration(0)
-	if handler != nil {
-		period = handler(ctx)
+	if s.GracefulShutdownHandler != nil {
+		var err error
+		period, err = s.GracefulShutdownHandler(ctx)
+		if err != nil {
+			forcedCause := errors.Join(cause, err)
+			return errors.Join(forcedCause, listenerErr, s.force(forcedCause))
+		}
 	}
 	if period <= 0 {
 		return errors.Join(cause, s.force(cause))
@@ -291,7 +269,7 @@ func (s *serveScope) shutdown(ctx context.Context, handler GracefulShutdownHandl
 	}
 }
 
-func (s *serveScope) maybeCloseDrainedLocked() {
+func (s *serveContext) maybeCloseDrainedLocked() {
 	if !s.stopping || len(s.connections) != 0 {
 		return
 	}
@@ -299,5 +277,20 @@ func (s *serveScope) maybeCloseDrainedLocked() {
 	case <-s.drained:
 	default:
 		close(s.drained)
+	}
+}
+
+func (s *serveContext) limitErrorHandler(handler ErrorHandler) ErrorHandler {
+	if handler == nil {
+		return nil
+	}
+	return func(ctx context.Context, scope ErrorScope, operation ErrorOperation, err error, respond ErrorResponder, next ErrorHandler) (bool, error) {
+		select {
+		case s.errorHandlerSlots <- struct{}{}:
+			defer func() { <-s.errorHandlerSlots }()
+			return handler(ctx, scope, operation, err, respond, next)
+		default:
+			return next(ctx, scope, operation, err, respond, next)
+		}
 	}
 }

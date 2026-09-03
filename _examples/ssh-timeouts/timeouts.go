@@ -14,7 +14,7 @@ var (
 )
 
 func main() {
-	ssh.Handle(func(s ssh.Session) {
+	ssh.Handle(func(s ssh.Session) error {
 		log.Println("new connection")
 		i := 0
 		for {
@@ -25,7 +25,7 @@ func main() {
 				continue
 			case <-s.Context().Done():
 				log.Println("connection closed")
-				return
+				return nil
 			}
 		}
 	})
