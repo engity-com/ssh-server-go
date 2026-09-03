@@ -57,6 +57,6 @@ func main() {
 	}
 
 	log.Println("DEVELOPMENT ONLY: anonymous authentication and an ephemeral host key")
-	log.Println("try: ssh -p 2222 localhost fail (or use fatal/ignore)")
+	log.Println("try: ssh -p 2222 127.0.0.1 fail (or use fatal/ignore)")
 	log.Fatal(server.ListenAndServe(context.Background()))
 }
