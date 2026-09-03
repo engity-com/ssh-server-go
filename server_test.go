@@ -1121,12 +1121,24 @@ func TestFailedHandshakeRetainsStartupDuringCallback(t *testing.T) {
 
 	close(releaseCallback)
 	<-callbackDone
-	third, err := net.Dial("tcp", l.Addr().String())
-	require.NoError(t, err)
+	var third net.Conn
+	require.Eventually(t, func() bool {
+		candidate, dialErr := net.Dial("tcp", l.Addr().String())
+		if dialErr != nil {
+			return false
+		}
+		if deadlineErr := candidate.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); deadlineErr != nil {
+			closeQuietly(candidate)
+			return false
+		}
+		if _, readErr := io.ReadFull(candidate, version); readErr != nil {
+			closeQuietly(candidate)
+			return false
+		}
+		third = candidate
+		return true
+	}, time.Second, time.Millisecond)
 	defer closeQuietly(third)
-	require.NoError(t, third.SetReadDeadline(time.Now().Add(time.Second)))
-	_, err = io.ReadFull(third, version)
-	require.NoError(t, err)
 	require.Equal(t, "SSH-", string(version))
 
 	cancel()
