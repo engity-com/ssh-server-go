@@ -7,7 +7,25 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	gosshagent "golang.org/x/crypto/ssh/agent"
 )
+
+type agentForwardingCallbackEvent struct {
+	contextUser      string
+	sessionUser      string
+	alreadyRequested bool
+}
+
+func receiveAgentForwardingCallbackEvent(t *testing.T, events <-chan agentForwardingCallbackEvent) agentForwardingCallbackEvent {
+	t.Helper()
+	select {
+	case event := <-events:
+		return event
+	case <-time.After(time.Second):
+		t.Fatal("agent forwarding callback was not called")
+		return agentForwardingCallbackEvent{}
+	}
+}
 
 func TestAgentListenerRemovesTemporaryDirectory(t *testing.T) {
 	listener, err := NewAgentListener()
@@ -20,18 +38,28 @@ func TestAgentListenerRemovesTemporaryDirectory(t *testing.T) {
 
 func TestAgentRequestedIsScopedToSession(t *testing.T) {
 	requested := make(chan bool, 2)
+	callbackCalled := make(chan agentForwardingCallbackEvent, 1)
 	first, client, cleanup := newTestSession(t, &Server{
 		Handler: func(s Session) error {
 			requested <- AgentRequested(s)
 			return nil
 		},
-		AgentForwardingCallback: func(Context, Session) (bool, error) { return true, nil },
+		AgentForwardingCallback: func(ctx Context, sess Session) (bool, error) {
+			callbackCalled <- agentForwardingCallbackEvent{
+				contextUser:      ctx.User(),
+				sessionUser:      sess.User(),
+				alreadyRequested: AgentRequested(sess),
+			}
+			return true, nil
+		},
 	}, nil)
 	defer cleanup()
 
-	ok, err := first.SendRequest(agentRequestType, true, nil)
-	require.NoError(t, err)
-	require.True(t, ok)
+	require.NoError(t, gosshagent.RequestAgentForwarding(first))
+	event := receiveAgentForwardingCallbackEvent(t, callbackCalled)
+	require.Equal(t, "testuser", event.contextUser)
+	require.Equal(t, "testuser", event.sessionUser)
+	require.False(t, event.alreadyRequested)
 	require.NoError(t, first.Run(""))
 	require.True(t, <-requested)
 
@@ -42,13 +70,45 @@ func TestAgentRequestedIsScopedToSession(t *testing.T) {
 	require.False(t, <-requested)
 }
 
-func TestAgentForwardingIsDeniedByDefault(t *testing.T) {
-	session, _, cleanup := newTestSession(t, &Server{Handler: func(Session) error { return nil }}, nil)
+func TestAgentForwardingIsDeniedByCallback(t *testing.T) {
+	requested := make(chan bool, 1)
+	callbackCalled := make(chan agentForwardingCallbackEvent, 1)
+	session, _, cleanup := newTestSession(t, &Server{
+		Handler: func(sess Session) error {
+			requested <- AgentRequested(sess)
+			return nil
+		},
+		AgentForwardingCallback: func(ctx Context, sess Session) (bool, error) {
+			callbackCalled <- agentForwardingCallbackEvent{
+				contextUser:      ctx.User(),
+				sessionUser:      sess.User(),
+				alreadyRequested: AgentRequested(sess),
+			}
+			return false, nil
+		},
+	}, nil)
 	defer cleanup()
 
-	ok, err := session.SendRequest(agentRequestType, true, nil)
-	require.NoError(t, err)
-	require.False(t, ok)
+	require.Error(t, gosshagent.RequestAgentForwarding(session))
+	event := receiveAgentForwardingCallbackEvent(t, callbackCalled)
+	require.Equal(t, "testuser", event.contextUser)
+	require.Equal(t, "testuser", event.sessionUser)
+	require.False(t, event.alreadyRequested)
+	require.NoError(t, session.Run(""))
+	require.False(t, <-requested)
+}
+
+func TestAgentForwardingIsDeniedByDefault(t *testing.T) {
+	requested := make(chan bool, 1)
+	session, _, cleanup := newTestSession(t, &Server{Handler: func(sess Session) error {
+		requested <- AgentRequested(sess)
+		return nil
+	}}, nil)
+	defer cleanup()
+
+	require.Error(t, gosshagent.RequestAgentForwarding(session))
+	require.NoError(t, session.Run(""))
+	require.False(t, <-requested)
 }
 
 func TestForwardAgentConnectionsClosesBlockedSSHConnection(t *testing.T) {
