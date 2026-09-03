@@ -495,8 +495,14 @@ func defaultClosingConnectionAndLogErrorAction(ctx context.Context, logger log.L
 	return defaultLogAndFailErrorAction(ctx, logger, scope, operation, err)
 }
 
-func defaultLogAndFailErrorAction(_ context.Context, logger log.Logger, scope ErrorScope, operation ErrorOperation, err error) (bool, error) {
+func defaultLogAndFailErrorAction(ctx context.Context, logger log.Logger, scope ErrorScope, operation ErrorOperation, err error) (bool, error) {
 	if err != nil {
+		if logger == nil {
+			logger = defaultServerLoggerGetter()
+		}
+		if conn, ok := ctx.Value(ContextKeyConn).(*gossh.ServerConn); ok && conn != nil {
+			logger = enrichLoggerForServerConnection(logger, conn)
+		}
 		logger.WithError(err).
 			With("scope", scope.String()).
 			With("operation", operation.String()).
