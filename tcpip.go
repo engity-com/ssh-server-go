@@ -374,16 +374,32 @@ func openForwardedChannel(ctx context.Context, forwardDone <-chan struct{}, conn
 			return nil, nil, net.ErrClosed
 		default:
 		}
-		opened := make(chan result, 1)
+		opened := make(chan result)
+		abandoned := make(chan struct{})
 		go func() {
+			select {
+			case <-abandoned:
+				return
+			default:
+			}
 			channel, requests, err := conn.OpenChannel(channelType, payload)
-			opened <- result{channel: channel, requests: requests, err: err}
+			openedResult := result{channel: channel, requests: requests, err: err}
+			select {
+			case opened <- openedResult:
+			case <-abandoned:
+				if err == nil {
+					if requests != nil {
+						go gossh.DiscardRequests(requests)
+					}
+					closeQuietly(channel)
+				}
+			}
 		}()
 		var openedResult result
 		select {
 		case openedResult = <-opened:
 		case <-ctx.Done():
-			closeQuietly(conn)
+			close(abandoned)
 			return nil, nil, context.Cause(ctx)
 		case <-forwardDone:
 			select {
@@ -393,14 +409,14 @@ func openForwardedChannel(ctx context.Context, forwardDone <-chan struct{}, conn
 				}
 				return nil, nil, net.ErrClosed
 			case <-ctx.Done():
-				closeQuietly(conn)
+				close(abandoned)
 				return nil, nil, context.Cause(ctx)
 			case <-timeout.C:
-				closeQuietly(conn)
+				close(abandoned)
 				return nil, nil, net.ErrClosed
 			}
 		case <-timeout.C:
-			closeQuietly(conn)
+			close(abandoned)
 			return nil, nil, fmt.Errorf("open %s channel: %w", channelType, context.DeadlineExceeded)
 		}
 		channel, requests, err := openedResult.channel, openedResult.requests, openedResult.err

@@ -201,7 +201,7 @@ type session struct {
 	breakSendWg       sync.WaitGroup
 	breakSends        int
 	exiting           atomic.Bool
-	requestStarted    atomic.Bool
+	requestResolved   atomic.Bool
 	handlerDone       <-chan struct{}
 	requestTimeout    time.Duration
 	logger            log.Logger
@@ -693,8 +693,8 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 	var requestTimer *time.Timer
 	if sess.requestTimeout > 0 {
 		requestTimer = time.AfterFunc(sess.requestTimeout, func() {
-			if !sess.requestStarted.Load() {
-				closeSSHConnection(sess.ctx)
+			if sess.requestResolved.CompareAndSwap(false, true) {
+				closeQuietly(sess)
 			}
 		})
 		defer requestTimer.Stop()
@@ -741,13 +741,15 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 				}
 			}
 
-			sess.handled = true
-			if !sess.reply(req, true) {
+			if !sess.requestResolved.CompareAndSwap(false, true) {
 				return
 			}
-			sess.requestStarted.Store(true)
+			sess.handled = true
 			if requestTimer != nil {
 				requestTimer.Stop()
+			}
+			if !sess.reply(req, true) {
+				return
 			}
 
 			sess.startHandler(sess.handler)
@@ -793,13 +795,15 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 				continue
 			}
 
-			sess.handled = true
-			if !sess.reply(req, true) {
+			if !sess.requestResolved.CompareAndSwap(false, true) {
 				return
 			}
-			sess.requestStarted.Store(true)
+			sess.handled = true
 			if requestTimer != nil {
 				requestTimer.Stop()
+			}
+			if !sess.reply(req, true) {
+				return
 			}
 
 			sess.startHandler(handler)

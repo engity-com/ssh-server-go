@@ -1,6 +1,7 @@
 package ssh
 
 import (
+	"io"
 	"net"
 	"os"
 	"testing"
@@ -111,10 +112,11 @@ func TestAgentForwardingIsDeniedByDefault(t *testing.T) {
 	require.False(t, <-requested)
 }
 
-func TestForwardAgentConnectionsClosesBlockedSSHConnection(t *testing.T) {
+func TestForwardAgentConnectionsDoesNotCloseBlockedSSHConnection(t *testing.T) {
 	listener := newLocalListener()
 	defer closeQuietly(listener)
-	sshConn := &blockingSSHConn{started: make(chan struct{}), closed: make(chan struct{})}
+	sshConn := &blockingSSHConn{started: make(chan struct{}), openRelease: make(chan struct{}), closed: make(chan struct{})}
+	defer sshConn.releaseOpen()
 	ctx, cancel := newContext(&Server{})
 	defer cancel()
 	ctx.SetValue(ContextKeyConn, sshConn)
@@ -128,10 +130,14 @@ func TestForwardAgentConnectionsClosesBlockedSSHConnection(t *testing.T) {
 	require.NoError(t, err)
 	defer closeQuietly(localConn)
 	<-sshConn.started
+	require.NoError(t, localConn.SetReadDeadline(time.Now().Add(2*forwardedChannelRegistrationTimeout)))
+	var b [1]byte
+	_, err = localConn.Read(b[:])
+	require.ErrorIs(t, err, io.EOF)
 	select {
 	case <-sshConn.closed:
-	case <-time.After(2 * forwardedChannelRegistrationTimeout):
-		t.Fatal("agent forwarding did not close a connection with a blocked channel open")
+		t.Fatal("agent forwarding closed the SSH connection")
+	default:
 	}
 	closeQuietly(listener)
 	select {
