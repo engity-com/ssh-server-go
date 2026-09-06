@@ -84,6 +84,43 @@ func newTestSession(t *testing.T, srv *Server, cfg *gossh.ClientConfig) (*gossh.
 	}
 }
 
+func startEchoClientSession(t *testing.T, session *gossh.Session) (io.WriteCloser, io.Reader) {
+	t.Helper()
+	stdin, err := session.StdinPipe()
+	require.NoError(t, err)
+	stdout, err := session.StdoutPipe()
+	require.NoError(t, err)
+	require.NoError(t, session.Shell())
+	return stdin, stdout
+}
+
+func requireEcho(t *testing.T, stdin io.Writer, stdout io.Reader, message string) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() {
+		if _, err := io.WriteString(stdin, message); err != nil {
+			done <- err
+			return
+		}
+		response := make([]byte, len(message))
+		if _, err := io.ReadFull(stdout, response); err != nil {
+			done <- err
+			return
+		}
+		if string(response) != message {
+			done <- fmt.Errorf("echo response = %q; want %q", response, message)
+			return
+		}
+		done <- nil
+	}()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for session echo")
+	}
+}
+
 func TestStdout(t *testing.T) {
 	t.Parallel()
 	testBytes := []byte("Hello world\n")
@@ -774,21 +811,48 @@ func TestMaxChannelsPerConnection(t *testing.T) {
 	closeQuietly(second)
 }
 
-func TestSessionRequestTimeoutClosesIdleSession(t *testing.T) {
-	timeout := 20 * time.Millisecond
-	session, client, cleanup := newTestSession(t, &Server{
-		Handler:               func(Session) error { return nil },
+func TestSessionRequestTimeoutClosesOnlyIdleSession(t *testing.T) {
+	timeout := 100 * time.Millisecond
+	handlerStarted := make(chan struct{}, 2)
+	active, client, cleanup := newTestSession(t, &Server{
+		Handler: func(session Session) error {
+			handlerStarted <- struct{}{}
+			_, err := io.Copy(session, session)
+			return err
+		},
 		SessionRequestTimeout: &timeout,
 	}, nil)
 	defer cleanup()
+	defer closeQuietly(active)
+	activeStdin, activeStdout := startEchoClientSession(t, active)
+	<-handlerStarted
 
-	payload := gossh.Marshal(struct{ Key, Value string }{Key: "name", Value: "value"})
-	require.Eventually(t, func() bool {
-		_, err := session.SendRequest("env", true, payload)
-		return err != nil
-	}, time.Second, 10*time.Millisecond)
-	_, err := client.NewSession()
-	require.Error(t, err, "session timeout must close the SSH connection, not only one channel")
+	idle, err := client.NewSession()
+	require.NoError(t, err)
+	defer closeQuietly(idle)
+	idleStdout, err := idle.StdoutPipe()
+	require.NoError(t, err)
+	idleClosed := make(chan error, 1)
+	go func() {
+		var b [1]byte
+		_, err := idleStdout.Read(b[:])
+		idleClosed <- err
+	}()
+	select {
+	case err := <-idleClosed:
+		require.ErrorIs(t, err, io.EOF)
+	case <-time.After(10 * timeout):
+		t.Fatal("idle session was not closed after its request timeout")
+	}
+
+	requireEcho(t, activeStdin, activeStdout, "active session remains usable")
+
+	next, err := client.NewSession()
+	require.NoError(t, err)
+	defer closeQuietly(next)
+	nextStdin, nextStdout := startEchoClientSession(t, next)
+	<-handlerStarted
+	requireEcho(t, nextStdin, nextStdout, "new session works")
 }
 
 func TestSessionLimitsRemainReservedUntilHandlerReturns(t *testing.T) {

@@ -255,9 +255,11 @@ func TestRemoteForwardListenerLimitIsSharedAcrossProtocolsWithinServe(t *testing
 }
 
 type blockingSSHConn struct {
-	started chan struct{}
-	closed  chan struct{}
-	once    sync.Once
+	started     chan struct{}
+	openRelease chan struct{}
+	closed      chan struct{}
+	closeOnce   sync.Once
+	releaseOnce sync.Once
 }
 
 func (c *blockingSSHConn) User() string          { return "test" }
@@ -271,11 +273,12 @@ func (c *blockingSSHConn) SendRequest(string, bool, []byte) (bool, []byte, error
 }
 func (c *blockingSSHConn) OpenChannel(string, []byte) (gossh.Channel, <-chan *gossh.Request, error) {
 	close(c.started)
-	<-c.closed
+	<-c.openRelease
 	return nil, nil, net.ErrClosed
 }
 func (c *blockingSSHConn) Close() error {
-	c.once.Do(func() { close(c.closed) })
+	c.closeOnce.Do(func() { close(c.closed) })
+	c.releaseOpen()
 	return nil
 }
 func (c *blockingSSHConn) Wait() error {
@@ -283,8 +286,13 @@ func (c *blockingSSHConn) Wait() error {
 	return net.ErrClosed
 }
 
-func TestOpenForwardedChannelClosesBlockedSSHConnection(t *testing.T) {
-	conn := &blockingSSHConn{started: make(chan struct{}), closed: make(chan struct{})}
+func (c *blockingSSHConn) releaseOpen() {
+	c.releaseOnce.Do(func() { close(c.openRelease) })
+}
+
+func TestOpenForwardedChannelTimeoutDoesNotCloseSSHConnection(t *testing.T) {
+	conn := &blockingSSHConn{started: make(chan struct{}), openRelease: make(chan struct{}), closed: make(chan struct{})}
+	defer conn.releaseOpen()
 	result := make(chan error, 1)
 	go func() {
 		_, _, err := openForwardedChannel(context.Background(), nil, conn, agentChannelType, nil)
@@ -299,7 +307,80 @@ func TestOpenForwardedChannelClosesBlockedSSHConnection(t *testing.T) {
 	}
 	select {
 	case <-conn.closed:
+		t.Fatal("SSH connection was closed")
 	default:
-		t.Fatal("SSH connection was not closed")
+	}
+}
+
+func TestForwardedChannelTimeoutKeepsSSHTransportUsable(t *testing.T) {
+	handler := &ForwardedTCPHandler{}
+	handlerStarted := make(chan struct{}, 2)
+	active, client, cleanup := newTestSession(t, &Server{
+		Handler: func(session Session) error {
+			handlerStarted <- struct{}{}
+			_, err := io.Copy(session, session)
+			return err
+		},
+		ReversePortForwardingCallback: func(Context, gossh.ConnMetadata, string, uint32) (bool, error) { return true, nil },
+		RequestHandlers: map[string]RequestHandler{
+			"tcpip-forward":        handler.HandleSSHRequest,
+			"cancel-tcpip-forward": handler.HandleSSHRequest,
+		},
+	}, nil)
+	defer cleanup()
+	defer closeQuietly(active)
+	activeStdin, activeStdout := startEchoClientSession(t, active)
+	<-handlerStarted
+
+	incoming := client.HandleChannelOpen(forwardedTCPChannelType)
+	require.NotNil(t, incoming)
+	ok, response, err := client.SendRequest("tcpip-forward", true, gossh.Marshal(&remoteForwardRequest{
+		BindAddr: "127.0.0.1",
+		BindPort: 0,
+	}))
+	require.NoError(t, err)
+	require.True(t, ok)
+	var forward remoteForwardSuccess
+	require.NoError(t, gossh.Unmarshal(response, &forward))
+
+	forwardConn, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(forward.BindPort))))
+	require.NoError(t, err)
+	defer closeQuietly(forwardConn)
+	var delayed gossh.NewChannel
+	select {
+	case delayed = <-incoming:
+		require.NotNil(t, delayed)
+		require.Equal(t, forwardedTCPChannelType, delayed.ChannelType())
+	case <-time.After(forwardedChannelRegistrationTimeout):
+		t.Fatal("did not receive forwarded-tcpip channel")
+	}
+
+	require.NoError(t, forwardConn.SetReadDeadline(time.Now().Add(2*forwardedChannelRegistrationTimeout)))
+	var b [1]byte
+	_, err = forwardConn.Read(b[:])
+	require.ErrorIs(t, err, io.EOF, "forwarded TCP connection must fail after the channel-open timeout")
+
+	requireEcho(t, activeStdin, activeStdout, "active session remains usable")
+	next, err := client.NewSession()
+	require.NoError(t, err)
+	defer closeQuietly(next)
+	nextStdin, nextStdout := startEchoClientSession(t, next)
+	<-handlerStarted
+	requireEcho(t, nextStdin, nextStdout, "new session works")
+
+	lateChannel, lateRequests, err := delayed.Accept()
+	require.NoError(t, err)
+	defer closeQuietly(lateChannel)
+	go gossh.DiscardRequests(lateRequests)
+	lateClosed := make(chan error, 1)
+	go func() {
+		_, err := lateChannel.Read(b[:])
+		lateClosed <- err
+	}()
+	select {
+	case err := <-lateClosed:
+		require.ErrorIs(t, err, io.EOF)
+	case <-time.After(time.Second):
+		t.Fatal("late forwarded-tcpip channel was not closed")
 	}
 }
