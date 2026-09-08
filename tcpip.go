@@ -77,10 +77,11 @@ func DirectTCPIPHandler(srv *Server, sshConn *gossh.ServerConn, newChan gossh.Ne
 		closeQuietly(conn)
 		return locateError(ErrorScopeChannel, ErrorOperationAccept, fmt.Errorf("accept direct-tcpip channel: %w", err))
 	}
-	go gossh.DiscardRequests(reqs)
+	channelCtx, cancelChannel := contextForChannelRequests(ctx, reqs)
+	defer cancelChannel()
 	defer closeQuietly(ch)
 	defer closeQuietly(conn)
-	if err := FullDuplexCopy(ctx, conn, ch, nil); err != nil {
+	if err := FullDuplexCopy(channelCtx, conn, ch, nil); err != nil {
 		return locateError(ErrorScopeForwarding, ErrorOperationForward, fmt.Errorf("forward direct-tcpip connection: %w", err))
 	}
 	return nil
@@ -312,8 +313,9 @@ func (h *ForwardedTCPHandler) HandleSSHRequest(response RequestResponseWriter, r
 						return
 					}
 					defer closeQuietly(ch)
-					go gossh.DiscardRequests(reqs)
-					if err := FullDuplexCopy(ctx, c, ch, nil); err != nil {
+					channelCtx, cancelChannel := contextForChannelRequests(ctx, reqs)
+					defer cancelChannel()
+					if err := FullDuplexCopy(channelCtx, c, ch, nil); err != nil {
 						if !dispatchErrorOrEscalate(ctx, h.loggerOfConnection(conn), errorHandler, ErrorScopeForwarding, ErrorOperationForward, err, nil, defaultLogAndFailErrorAction) {
 							f.close()
 						}
@@ -355,6 +357,15 @@ func (h *ForwardedTCPHandler) HandleSSHRequest(response RequestResponseWriter, r
 	default:
 		return response.Reject(nil)
 	}
+}
+
+func contextForChannelRequests(ctx context.Context, requests <-chan *gossh.Request) (context.Context, context.CancelFunc) {
+	channelCtx, cancel := context.WithCancel(ctx)
+	go func() {
+		gossh.DiscardRequests(requests)
+		cancel()
+	}()
+	return channelCtx, cancel
 }
 
 func openForwardedChannel(ctx context.Context, forwardDone <-chan struct{}, conn gossh.Conn, channelType string, payload []byte) (gossh.Channel, <-chan *gossh.Request, error) {

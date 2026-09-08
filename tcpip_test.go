@@ -104,6 +104,46 @@ func TestLocalPortForwardingHidesDialError(t *testing.T) {
 	require.NotContains(t, strings.ToLower(err.Error()), "refused")
 }
 
+func TestLocalPortForwardingReleasesChannelSlotAfterChannelClose(t *testing.T) {
+	target := newLocalListener()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, err := target.Accept()
+		if err == nil {
+			accepted <- conn
+		}
+	}()
+	maxChannels := 1
+	initial, client, cleanup := newTestSession(t, &Server{
+		Handler:                  func(Session) error { return nil },
+		MaxChannelsPerConnection: &maxChannels,
+		LocalPortForwardingCallback: func(Context, gossh.ConnMetadata, string, uint32) (bool, error) {
+			return true, nil
+		},
+	}, nil)
+	defer cleanup()
+	defer closeQuietly(target)
+	require.NoError(t, initial.Close())
+
+	var forwarded net.Conn
+	require.Eventually(t, func() bool {
+		var err error
+		forwarded, err = client.Dial("tcp", target.Addr().String())
+		return err == nil
+	}, time.Second, time.Millisecond)
+	targetPeer := <-accepted
+	defer closeQuietly(targetPeer)
+	require.NoError(t, forwarded.Close())
+
+	var next *gossh.Session
+	require.Eventually(t, func() bool {
+		var err error
+		next, err = client.NewSession()
+		return err == nil
+	}, time.Second, time.Millisecond)
+	closeQuietly(next)
+}
+
 func TestRemotePortZeroForwardIsRemovedOnCancel(t *testing.T) {
 	handler := &ForwardedTCPHandler{}
 	session, client, cleanup := newTestSession(t, &Server{
@@ -206,6 +246,42 @@ func TestRemoteForwardListenerLimit(t *testing.T) {
 		return err == nil
 	}, time.Second, time.Millisecond)
 	closeQuietly(second)
+}
+
+func TestRemotePortForwardingReleasesChannelSlotAfterChannelClose(t *testing.T) {
+	maxChannels := 1
+	handler := &ForwardedTCPHandler{}
+	initial, client, cleanup := newTestSession(t, &Server{
+		Handler:                  func(Session) error { return nil },
+		MaxChannelsPerConnection: &maxChannels,
+		ReversePortForwardingCallback: func(Context, gossh.ConnMetadata, string, uint32) (bool, error) {
+			return true, nil
+		},
+		RequestHandlers: map[string]RequestHandler{
+			"tcpip-forward":        handler.HandleSSHRequest,
+			"cancel-tcpip-forward": handler.HandleSSHRequest,
+		},
+	}, nil)
+	defer cleanup()
+	require.NoError(t, initial.Close())
+
+	listener, err := client.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer closeQuietly(listener)
+	tcpPeer, err := net.Dial("tcp", listener.Addr().String())
+	require.NoError(t, err)
+	defer closeQuietly(tcpPeer)
+	forwarded, err := listener.Accept()
+	require.NoError(t, err)
+	require.NoError(t, forwarded.Close())
+
+	var next *gossh.Session
+	require.Eventually(t, func() bool {
+		var err error
+		next, err = client.NewSession()
+		return err == nil
+	}, time.Second, time.Millisecond)
+	closeQuietly(next)
 }
 
 func TestRemoteForwardListenerLimitIsSharedAcrossProtocolsWithinServe(t *testing.T) {
