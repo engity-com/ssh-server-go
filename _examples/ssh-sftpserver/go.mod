@@ -14,6 +14,6 @@ require (
 	github.com/echocat/slf4g v1.8.4 // indirect
 	github.com/kr/fs v0.1.0 // indirect
 	github.com/pires/go-proxyproto v0.15.0 // indirect
-	golang.org/x/crypto v0.56.0 // indirect
+	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
 )
