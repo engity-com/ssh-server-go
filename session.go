@@ -22,6 +22,7 @@ import (
 const (
 	maxSessionErrorResponseBytes = 4096
 	sessionErrorResponseTimeout  = time.Second
+	subsystemReplyWriteTimeout   = time.Second
 )
 
 // Session provides access to information about an SSH session and methods
@@ -147,21 +148,36 @@ func DefaultSessionHandler(srv *Server, conn *gossh.ServerConn, newChan gossh.Ne
 		return locateError(ErrorScopeChannel, ErrorOperationAccept, err)
 	}
 	sess := &session{
-		Channel:           ch,
-		conn:              conn,
-		handler:           srv.handler(),
-		ptyCb:             srv.PtyCallback,
-		sessReqCb:         srv.SessionRequestCallback,
-		agentForwardingCb: srv.AgentForwardingCallback,
-		subsystemHandlers: srv.subsystemHandlers(),
-		errorHandler:      errorHandlerFromContext(ctx, srv),
-		requestTimeout:    configuredDuration(srv.SessionRequestTimeout, DefaultSessionRequestTimeout),
-		ctx:               &sessionAgentContext{Context: ctx},
-		logger:            srv.Logger,
+		Channel:                   ch,
+		conn:                      conn,
+		handler:                   srv.handler(),
+		ptyCb:                     srv.PtyCallback,
+		sessReqCb:                 srv.SessionRequestCallback,
+		agentForwardingCb:         srv.AgentForwardingCallback,
+		subsystemHandlers:         srv.subsystemHandlers(),
+		deferredSubsystemHandlers: srv.DeferredSubsystemHandlers,
+		errorHandler:              errorHandlerFromContext(ctx, srv),
+		requestTimeout:            configuredDuration(srv.SessionRequestTimeout, DefaultSessionRequestTimeout),
+		subsystemReplyTimeout:     DefaultSubsystemReplyTimeout,
+		ctx:                       &sessionAgentContext{Context: ctx},
+		logger:                    srv.Logger,
+	}
+	if srv.SubsystemReplyTimeout != nil && *srv.SubsystemReplyTimeout > 0 {
+		sess.subsystemReplyTimeout = *srv.SubsystemReplyTimeout
 	}
 	sess.handleRequests(reqs)
 	if sess.handlerDone != nil {
 		<-sess.handlerDone
+	} else if sess.deferredDone != nil {
+		// Keep the session slot reserved while a rejected handler winds down.
+		// A disconnected peer must not make server shutdown wait for it.
+		select {
+		case <-sess.deferredDone:
+		case <-ctx.Done():
+		}
+	}
+	if sess.deferredCancel != nil {
+		sess.deferredCancel()
 	}
 	return nil
 }
@@ -173,38 +189,171 @@ type session struct {
 	breakConfigMu sync.Mutex
 	breakReplyMu  sync.Mutex
 	gossh.Channel
-	conn              *gossh.ServerConn
-	handler           Handler
-	subsystemHandlers map[string]SubsystemHandler
-	errorHandler      ErrorHandler
-	handled           bool
-	exited            bool
-	pty               *Pty
-	winch             chan Window
-	env               []string
-	envBytes          int
-	ptyCb             PtyCallback
-	sessReqCb         SessionRequestCallback
-	agentForwardingCb AgentForwardingCallback
-	rawCmd            string
-	subsystem         string
-	ctx               Context
-	sigCh             chan<- Signal
-	sigBuf            []Signal
-	sigDrainCancel    chan struct{}
-	sigDrainDone      chan struct{}
-	sigSendCancel     chan struct{}
-	sigSendWg         sync.WaitGroup
-	sigSends          int
-	breakCh           chan<- bool
-	breakSendCancel   chan struct{}
-	breakSendWg       sync.WaitGroup
-	breakSends        int
-	exiting           atomic.Bool
-	requestResolved   atomic.Bool
-	handlerDone       <-chan struct{}
-	requestTimeout    time.Duration
-	logger            log.Logger
+	conn                      *gossh.ServerConn
+	handler                   Handler
+	subsystemHandlers         map[string]SubsystemHandler
+	deferredSubsystemHandlers map[string]DeferredSubsystemHandler
+	errorHandler              ErrorHandler
+	handled                   bool
+	exited                    bool
+	pty                       *Pty
+	winch                     chan Window
+	env                       []string
+	envBytes                  int
+	ptyCb                     PtyCallback
+	sessReqCb                 SessionRequestCallback
+	agentForwardingCb         AgentForwardingCallback
+	rawCmd                    string
+	subsystem                 string
+	ctx                       Context
+	sigCh                     chan<- Signal
+	sigBuf                    []Signal
+	sigDrainCancel            chan struct{}
+	sigDrainDone              chan struct{}
+	sigSendCancel             chan struct{}
+	sigSendWg                 sync.WaitGroup
+	sigSends                  int
+	breakCh                   chan<- bool
+	breakSendCancel           chan struct{}
+	breakSendWg               sync.WaitGroup
+	breakSends                int
+	exiting                   atomic.Bool
+	requestResolved           atomic.Bool
+	handlerDone               <-chan struct{}
+	requestTimeout            time.Duration
+	subsystemReplyTimeout     time.Duration
+	deferredState             atomic.Int32 // 0: normal/accepted, 1: pending, 2: rejected
+	deferredCancel            context.CancelFunc
+	deferredDone              <-chan struct{}
+	logger                    log.Logger
+}
+
+type deferredSubsystemResponse struct {
+	sync.Mutex
+	sess     *session
+	req      *gossh.Request
+	done     chan struct{}
+	answered bool
+	accepted bool
+	err      error
+}
+
+func (r *deferredSubsystemResponse) reply(accepted bool) error {
+	r.Lock()
+	defer r.Unlock()
+	if r.answered {
+		return ErrSubsystemResponseAlreadySent
+	}
+	if r.sess.ctx.Err() != nil {
+		r.answered = true
+		r.sess.deferredState.Store(2)
+		close(r.done)
+		return ErrSubsystemResponseAlreadySent
+	}
+	r.answered = true
+	if !accepted {
+		r.sess.deferredState.Store(2)
+	}
+	r.accepted = accepted
+	// A blocked transport write must not hold the decision (or the client)
+	// indefinitely. Only this exceptional case requires closing the connection.
+	writeTimeout := time.AfterFunc(subsystemReplyWriteTimeout, func() {
+		select {
+		case <-r.done:
+		default:
+			closeSSHConnection(r.sess.ctx)
+		}
+	})
+	r.err = r.req.Reply(accepted, nil)
+	if r.err != nil {
+		r.sess.deferredState.Store(2)
+		closeSSHConnection(r.sess.ctx)
+	} else if accepted {
+		r.sess.deferredState.Store(0)
+	}
+	close(r.done)
+	writeTimeout.Stop()
+	return r.err
+}
+
+func (r *deferredSubsystemResponse) abandon() {
+	r.Lock()
+	defer r.Unlock()
+	if !r.answered {
+		r.answered = true
+		r.sess.deferredState.Store(2)
+		close(r.done)
+	}
+}
+
+// waitDeferredSubsystem stops consuming requests while the subsystem reply is
+// pending. At most one later request is read to detect channel closure.
+func (sess *session) waitDeferredSubsystem(req *gossh.Request, reqs <-chan *gossh.Request, handler DeferredSubsystemHandler) (*gossh.Request, bool) {
+	ctx, cancel := context.WithCancel(sess.ctx)
+	sess.ctx = &deferredSessionContext{Context: sess.ctx, decision: ctx}
+	sess.deferredCancel = cancel
+	sess.deferredState.Store(1)
+	response := &deferredSubsystemResponse{sess: sess, req: req, done: make(chan struct{})}
+	returned := make(chan error, 1)
+	done := make(chan struct{})
+	sess.deferredDone = done
+	go func() {
+		defer close(done)
+		returned <- handler(sess, response.reply)
+	}()
+	timer := time.NewTimer(sess.subsystemReplyTimeout)
+	defer timer.Stop()
+	var next *gossh.Request
+	for {
+		select {
+		case <-response.done:
+		case err := <-returned:
+			if err != nil {
+				// Report errors only after the failure reply has been sent.
+				defer func() {
+					if response.accepted == false {
+						dispatchErrorOrEscalate(sess.ctx, sess.getLogger(), sess.errorHandler, ErrorScopeSession, ErrorOperationHandle, err, nil, defaultLogAndFailErrorAction)
+					}
+				}()
+			}
+			_ = response.reply(false)
+			returned <- err
+		case <-timer.C:
+			_ = response.reply(false)
+		case <-sess.ctx.Done():
+			response.abandon()
+		case later, ok := <-reqs:
+			if !ok {
+				response.abandon()
+			} else {
+				next = later
+			}
+		}
+		response.Lock()
+		answered, accepted, err := response.answered, response.accepted, response.err
+		response.Unlock()
+		if !answered {
+			continue
+		}
+		if !accepted || err != nil {
+			cancel()
+			_ = sess.Channel.Close()
+			return nil, false
+		}
+		sess.startHandler(func(Session) error { return <-returned })
+		return next, true
+	}
+}
+
+type deferredSessionContext struct {
+	Context
+	decision context.Context
+}
+
+func (c *deferredSessionContext) Done() <-chan struct{} { return c.decision.Done() }
+func (c *deferredSessionContext) Err() error            { return c.decision.Err() }
+func (c *deferredSessionContext) Deadline() (time.Time, bool) {
+	return c.decision.Deadline()
 }
 
 func (sess *session) Write(p []byte) (n int, err error) {
@@ -245,6 +394,9 @@ func (sess *session) Context() Context {
 }
 
 func (sess *session) Exit(code int) error {
+	if sess.deferredState.Load() != 0 {
+		return ErrSubsystemResponsePending
+	}
 	if code < 0 || uint64(code) > uint64(math.MaxUint32) {
 		return fmt.Errorf("ssh: invalid session exit status %d", code)
 	}
@@ -267,6 +419,13 @@ func (sess *session) Exit(code int) error {
 	status := struct{ Status uint32 }{uint32(code)} // #nosec G115 -- range checked above
 	_, requestErr := sess.SendRequest("exit-status", false, gossh.Marshal(&status))
 	return errors.Join(requestErr, sess.Close())
+}
+
+func (sess *session) Close() error {
+	if sess.deferredState.Load() == 1 {
+		return ErrSubsystemResponsePending
+	}
+	return sess.Channel.Close()
 }
 
 func (sess *session) User() string {
@@ -705,7 +864,17 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 		}
 	}()
 
-	for req := range reqs {
+	var pending *gossh.Request
+	for {
+		req := pending
+		if req == nil {
+			var ok bool
+			req, ok = <-reqs
+			if !ok {
+				return
+			}
+		}
+		pending = nil
 		switch req.Type {
 		case "shell", "exec":
 			if sess.handled || sess.handler == nil {
@@ -786,10 +955,12 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 			}
 
 			handler := sess.subsystemHandlers[payload.Value]
-			if handler == nil {
+			deferred := sess.deferredSubsystemHandlers[payload.Value]
+			if handler == nil && deferred == nil {
 				handler = sess.subsystemHandlers["default"]
+				deferred = sess.deferredSubsystemHandlers["default"]
 			}
-			if handler == nil {
+			if handler == nil && deferred == nil {
 				sess.subsystem = ""
 				_ = req.Reply(false, nil)
 				continue
@@ -801,6 +972,14 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 			sess.handled = true
 			if requestTimer != nil {
 				requestTimer.Stop()
+			}
+			if deferred != nil {
+				var proceed bool
+				pending, proceed = sess.waitDeferredSubsystem(req, reqs, deferred)
+				if !proceed {
+					return
+				}
+				continue
 			}
 			if !sess.reply(req, true) {
 				return
