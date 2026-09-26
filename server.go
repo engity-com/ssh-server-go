@@ -30,6 +30,37 @@ var (
 // ErrorHandler and exit-status semantics as Handler errors.
 type SubsystemHandler func(s Session) error
 
+// SubsystemReply answers the original subsystem request. Call it once before
+// the DeferredSubsystemHandler returns. It blocks until the SSH reply is sent
+// or the write fails; a duplicate or late call returns
+// ErrSubsystemResponseAlreadySent. If the write blocks for more than one
+// second, the connection is closed to unblock it.
+type SubsystemReply func(accepted bool) error
+
+// DeferredSubsystemHandler decides whether to accept a subsystem after payload
+// validation and SessionRequestCallback. The Session exposes the requested name
+// through Subsystem(). Call reply(true) only after upstream acceptance, before
+// writing channel data, sending channel requests, or returning. Returning
+// without replying, replying false, or exceeding SubsystemReplyTimeout sends
+// failure and closes the channel without an exit status. If the connection or
+// channel closes first, the reply may no longer be delivered.
+//
+// After replying true, returned errors have the same ErrorHandler and
+// exit-status semantics as SubsystemHandler. On rejection or disconnect,
+// Context().Done() is canceled; handlers should stop promptly. The session
+// slot remains reserved until the handler returns or the connection closes.
+// Exit before acceptance (also after rejection) and Close while a reply is
+// pending return ErrSubsystemResponsePending.
+type DeferredSubsystemHandler func(s Session, reply SubsystemReply) error
+
+var (
+	// ErrSubsystemResponseAlreadySent indicates a duplicate or late reply.
+	ErrSubsystemResponseAlreadySent = errors.New("ssh: subsystem response already sent")
+	// ErrSubsystemResponsePending prevents Exit before acceptance and Close
+	// while the original subsystem response is still pending.
+	ErrSubsystemResponsePending = errors.New("ssh: subsystem response pending or rejected")
+)
+
 // DefaultSubsystemHandlers is used by servers with nil SubsystemHandlers. It
 // must not be mutated while any such server is serving connections.
 var DefaultSubsystemHandlers = map[string]SubsystemHandler{}
@@ -152,6 +183,7 @@ const (
 	DefaultIdleTimeout                     = time.Duration(0)
 	DefaultMaxTimeout                      = time.Duration(0)
 	DefaultSessionRequestTimeout           = 30 * time.Second
+	DefaultSubsystemReplyTimeout           = 30 * time.Second
 	DefaultMaxStartupsStart                = 10
 	DefaultMaxStartupsRate                 = 30
 	DefaultMaxStartupsFull                 = 100
@@ -221,13 +253,18 @@ type Server struct {
 	ProxyProtocol *ProxyProtocolConfig
 
 	// Timeout fields use their Default* value when nil. A configured duration
-	// less than or equal to zero disables that timeout.
+	// less than or equal to zero disables that timeout, except for
+	// SubsystemReplyTimeout, which cannot be disabled.
 	HandshakeTimeout *time.Duration // timeout until successful authentication, default 2 minutes
 	IdleTimeout      *time.Duration // timeout when no activity, disabled by default
 	MaxTimeout       *time.Duration // absolute connection timeout, disabled by default
 	// SessionRequestTimeout limits how long an accepted session channel may wait
 	// for shell, exec, or subsystem. The default is 30 seconds.
 	SessionRequestTimeout *time.Duration
+	// SubsystemReplyTimeout bounds a deferred subsystem decision. Nil or a
+	// nonpositive value uses DefaultSubsystemReplyTimeout; unlike other timeouts
+	// it cannot be disabled. A timeout rejects and closes only this channel.
+	SubsystemReplyTimeout *time.Duration
 
 	// Limit fields use their Default* value when nil. A configured value less
 	// than or equal to zero disables that limit, meaning no limit is enforced.
@@ -253,6 +290,13 @@ type Server struct {
 	// SubsystemHandlers are handlers which are similar to the usual SSH command
 	// handlers, but handle named subsystems.
 	SubsystemHandlers map[string]SubsystemHandler
+	// DeferredSubsystemHandlers are opt-in handlers whose response to a
+	// subsystem request can be delayed. A named entry takes precedence over
+	// SubsystemHandlers for that name. The "default" entry is used only if
+	// neither map has a handler for the requested name, and takes precedence
+	// over the ordinary "default" handler. Requests on the same channel are
+	// answered in order while a decision is pending, without an unbounded queue.
+	DeferredSubsystemHandlers map[string]DeferredSubsystemHandler
 
 	prepareOnce          sync.Once
 	prepareDone          chan struct{}
