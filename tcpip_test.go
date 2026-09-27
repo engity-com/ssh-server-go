@@ -299,8 +299,8 @@ func TestRemoteForwardListenCallbackPortAndMetadata(t *testing.T) {
 	}, time.Second, time.Millisecond)
 }
 
-func TestRemoteForwardListenCallbackUsesBoundPortInsteadOfRequestedPort(t *testing.T) {
-	listeners := make(chan *trackedTCPListener, 1)
+func TestRemoteForwardListenCallbackRejectsUnexpectedPort(t *testing.T) {
+	listeners := make(chan *trackedTCPListener, 2)
 	handler := &ForwardedTCPHandler{
 		ListenCallback: func(ctx Context, _ gossh.ConnMetadata, _ string, _ uint32) (net.Listener, error) {
 			ln, err := new(net.ListenConfig).Listen(ctx, "tcp", "127.0.0.1:0")
@@ -312,6 +312,62 @@ func TestRemoteForwardListenCallbackUsesBoundPortInsteadOfRequestedPort(t *testi
 			return tracked, nil
 		},
 	}
+	maxForwards := 1
+	_, client, cleanup := newTestSession(t, &Server{
+		MaxReverseForwardsPerConnection: &maxForwards,
+		ReversePortForwardingCallback:   func(Context, gossh.ConnMetadata, string, uint32) (bool, error) { return true, nil },
+		RequestHandlers: map[string]RequestHandler{
+			"tcpip-forward":        handler.HandleSSHRequest,
+			"cancel-tcpip-forward": handler.HandleSSHRequest,
+		},
+	}, nil)
+	defer cleanup()
+
+	const requestedPort = 1
+	_, err := client.Listen("tcp", "127.0.0.1:1")
+	require.Error(t, err)
+	listener := <-listeners
+	require.NotEqual(t, requestedPort, listener.Addr().(*net.TCPAddr).Port)
+	select {
+	case <-listener.closed:
+	case <-time.After(time.Second):
+		t.Fatal("rejected listener was not closed")
+	}
+	handler.Lock()
+	count := len(handler.forwards)
+	handler.Unlock()
+	require.Zero(t, count)
+	next, err := client.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err, "rejected listener must release the forward slot")
+	require.NoError(t, next.Close())
+}
+
+type formattedTCPAddr string
+
+func (formattedTCPAddr) Network() string  { return "tcp" }
+func (a formattedTCPAddr) String() string { return string(a) }
+
+type formattedTCPListener struct {
+	*trackedTCPListener
+	addr net.Addr
+}
+
+func (l *formattedTCPListener) Addr() net.Addr { return l.addr }
+
+func TestRemoteForwardListenCallbackCanonicalizesPort(t *testing.T) {
+	listeners := make(chan *trackedTCPListener, 1)
+	handler := &ForwardedTCPHandler{
+		ListenCallback: func(ctx Context, _ gossh.ConnMetadata, _ string, _ uint32) (net.Listener, error) {
+			ln, err := new(net.ListenConfig).Listen(ctx, "tcp", "127.0.0.1:0")
+			if err != nil {
+				return nil, err
+			}
+			tracked := &trackedTCPListener{Listener: ln, closed: make(chan struct{})}
+			listeners <- tracked
+			port := strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)
+			return &formattedTCPListener{tracked, formattedTCPAddr(net.JoinHostPort("127.0.0.1", "000"+port))}, nil
+		},
+	}
 	_, client, cleanup := newTestSession(t, &Server{
 		ReversePortForwardingCallback: func(Context, gossh.ConnMetadata, string, uint32) (bool, error) { return true, nil },
 		RequestHandlers: map[string]RequestHandler{
@@ -321,23 +377,114 @@ func TestRemoteForwardListenCallbackUsesBoundPortInsteadOfRequestedPort(t *testi
 	}, nil)
 	defer cleanup()
 
-	const requestedPort = 1
-	ok, reply, err := client.SendRequest("tcpip-forward", true, gossh.Marshal(&remoteForwardRequest{BindAddr: "127.0.0.1", BindPort: requestedPort}))
+	listener, err := client.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	require.True(t, ok)
-	listener := <-listeners
-	var success remoteForwardSuccess
-	require.NoError(t, gossh.Unmarshal(reply, &success))
-	require.Equal(t, uint32(listener.Addr().(*net.TCPAddr).Port), success.BindPort)
-	require.NotEqual(t, uint32(requestedPort), success.BindPort)
-	ok, _, err = client.SendRequest("cancel-tcpip-forward", true, gossh.Marshal(&remoteForwardCancelRequest{BindAddr: "127.0.0.1", BindPort: success.BindPort}))
-	require.NoError(t, err)
-	require.True(t, ok)
+	tracked := <-listeners
+	require.Equal(t, tracked.Addr().(*net.TCPAddr).Port, listener.Addr().(*net.TCPAddr).Port)
+	require.NoError(t, listener.Close())
 	select {
-	case <-listener.closed:
+	case <-tracked.closed:
 	case <-time.After(time.Second):
-		t.Fatal("cancel did not close callback listener")
+		t.Fatal("cancel did not close listener with formatted port")
 	}
+	require.Eventually(t, func() bool {
+		handler.Lock()
+		defer handler.Unlock()
+		return len(handler.forwards) == 0
+	}, time.Second, time.Millisecond)
+}
+
+func TestRemoteForwardListenCallbackRejectsDuplicateBoundPort(t *testing.T) {
+	maxForwards := 2
+	listeners := make(chan *trackedTCPListener, 3)
+	var firstPort atomic.Int32
+	var calls atomic.Int32
+	handler := &ForwardedTCPHandler{
+		ListenCallback: func(ctx Context, _ gossh.ConnMetadata, _ string, _ uint32) (net.Listener, error) {
+			ln, err := new(net.ListenConfig).Listen(ctx, "tcp", "127.0.0.1:0")
+			if err != nil {
+				return nil, err
+			}
+			tracked := &trackedTCPListener{Listener: ln, closed: make(chan struct{})}
+			listeners <- tracked
+			switch calls.Add(1) {
+			case 1:
+				firstPort.Store(int32(ln.Addr().(*net.TCPAddr).Port))
+			case 2:
+				return &formattedTCPListener{tracked, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 2), Port: int(firstPort.Load())}}, nil
+			}
+			return tracked, nil
+		},
+	}
+	_, client, cleanup := newTestSession(t, &Server{
+		MaxReverseForwardsPerConnection: &maxForwards,
+		ReversePortForwardingCallback:   func(Context, gossh.ConnMetadata, string, uint32) (bool, error) { return true, nil },
+		RequestHandlers: map[string]RequestHandler{
+			"tcpip-forward":        handler.HandleSSHRequest,
+			"cancel-tcpip-forward": handler.HandleSSHRequest,
+		},
+	}, nil)
+	defer cleanup()
+
+	first, err := client.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer closeQuietly(first)
+	firstServer := <-listeners
+	_, err = client.Listen("tcp", "127.0.0.1:0")
+	require.Error(t, err)
+	duplicate := <-listeners
+	select {
+	case <-duplicate.closed:
+	case <-time.After(time.Second):
+		t.Fatal("duplicate listener was not closed")
+	}
+	select {
+	case <-firstServer.closed:
+		t.Fatal("duplicate closed the existing listener")
+	default:
+	}
+
+	third, err := client.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err, "duplicate must release its forward slot")
+	defer closeQuietly(third)
+	<-listeners
+	peer, err := net.Dial("tcp", firstServer.Addr().String())
+	require.NoError(t, err)
+	defer closeQuietly(peer)
+	forwarded := acceptStreamLocal(t, first)
+	defer closeQuietly(forwarded)
+	assertStreamLocalExchange(t, forwarded, peer)
+	require.NoError(t, first.Close())
+	require.NoError(t, third.Close())
+	require.Eventually(t, func() bool {
+		handler.Lock()
+		defer handler.Unlock()
+		return len(handler.forwards) == 0
+	}, time.Second, time.Millisecond)
+}
+
+func TestRemoteForwardListenCallbackCanRebindAfterCancel(t *testing.T) {
+	handler := &ForwardedTCPHandler{
+		ListenCallback: func(ctx Context, _ gossh.ConnMetadata, host string, port uint32) (net.Listener, error) {
+			return new(net.ListenConfig).Listen(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(int(port))))
+		},
+	}
+	_, client, cleanup := newTestSession(t, &Server{
+		ReversePortForwardingCallback: func(Context, gossh.ConnMetadata, string, uint32) (bool, error) { return true, nil },
+		RequestHandlers: map[string]RequestHandler{
+			"tcpip-forward":        handler.HandleSSHRequest,
+			"cancel-tcpip-forward": handler.HandleSSHRequest,
+		},
+	}, nil)
+	defer cleanup()
+
+	first, err := client.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := first.Addr().String()
+	require.NoError(t, first.Close())
+	second, err := client.Listen("tcp", addr)
+	require.NoError(t, err, "a confirmed cancel must allow immediate reuse of the same port")
+	require.NoError(t, second.Close())
 }
 
 func TestRemoteForwardListenCallbackFailureReleasesLimit(t *testing.T) {
