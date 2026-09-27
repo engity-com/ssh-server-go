@@ -114,6 +114,15 @@ type remoteForwardChannelData struct {
 type ForwardedTCPHandler struct {
 	Logger log.Logger
 
+	// ListenCallback creates the listener after reverse forwarding has been
+	// authorized and a forward slot reserved. It receives the original bind
+	// address and port (including port 0). Any returned listener, even on
+	// error, is closed by the handler; Close must unblock Accept.
+	// For a nonzero requested port, the listener must bind that same port.
+	// If nil, the handler listens on TCP in the server process. Callbacks must
+	// honor context cancellation.
+	ListenCallback func(ctx Context, conn gossh.ConnMetadata, bindHost string, bindPort uint32) (net.Listener, error)
+
 	forwards map[forwardKey]*forward
 	sync.Mutex
 }
@@ -210,18 +219,59 @@ func (h *ForwardedTCPHandler) HandleSSHRequest(response RequestResponseWriter, r
 			forwardLimiter.release()
 			return response.Reject(nil)
 		}
-		ln, err := new(net.ListenConfig).Listen(ctx, "tcp", addr)
+		var ln net.Listener
+		if h.ListenCallback != nil {
+			ln, err = h.ListenCallback(ctx, conn, reqPayload.BindAddr, reqPayload.BindPort)
+		} else {
+			ln, err = new(net.ListenConfig).Listen(ctx, "tcp", addr)
+		}
 		if err != nil {
+			closeQuietly(ln)
 			finishAcquisition(nil)
 			forwardLimiter.release()
 			return locateError(ErrorScopeForwarding, ErrorOperationListen, fmt.Errorf("listen for tcpip-forward on %s: %w", addr, err))
 		}
-		_, destPortStr, _ := net.SplitHostPort(ln.Addr().String())
-		destPort, _ := strconv.ParseUint(destPortStr, 10, 16)
-		key := forwardKey{conn: conn, addr: net.JoinHostPort(reqPayload.BindAddr, destPortStr)}
+		if ln == nil {
+			finishAcquisition(nil)
+			forwardLimiter.release()
+			return locateError(ErrorScopeForwarding, ErrorOperationListen, fmt.Errorf("listen for tcpip-forward on %s: callback returned no listener", addr))
+		}
+		var destPortStr string
+		var destPort uint64
+		listenerAddr := ln.Addr()
+		if listenerAddr != nil {
+			_, destPortStr, err = net.SplitHostPort(listenerAddr.String())
+			if err == nil {
+				destPort, err = strconv.ParseUint(destPortStr, 10, 16)
+			}
+		} else {
+			err = errors.New("listener returned no address")
+		}
+		if err == nil && destPort == 0 {
+			err = errors.New("listener has no bound port")
+		}
+		if err != nil {
+			closeQuietly(ln)
+			finishAcquisition(nil)
+			forwardLimiter.release()
+			return locateError(ErrorScopeForwarding, ErrorOperationListen, fmt.Errorf("listen for tcpip-forward on %s: invalid listener address %v: %w", addr, listenerAddr, err))
+		}
+		if reqPayload.BindPort != 0 && uint64(reqPayload.BindPort) != destPort {
+			closeQuietly(ln)
+			finishAcquisition(nil)
+			forwardLimiter.release()
+			return locateError(ErrorScopeForwarding, ErrorOperationListen, fmt.Errorf("listen for tcpip-forward on %s: listener bound unexpected port %d", addr, destPort))
+		}
+		key := forwardKey{conn: conn, addr: net.JoinHostPort(reqPayload.BindAddr, strconv.FormatUint(destPort, 10))}
 		f := newForward(ln, forwardLimiter.release)
 		unregisterForward := finishAcquisition(f.close)
 		h.Lock()
+		if _, exists := h.forwards[key]; exists {
+			h.Unlock()
+			unregisterForward()
+			f.close()
+			return response.Reject(nil)
+		}
 		h.forwards[key] = f
 		h.Unlock()
 		responseState := request.response
@@ -351,6 +401,13 @@ func (h *ForwardedTCPHandler) HandleSSHRequest(response RequestResponseWriter, r
 		h.Unlock()
 		if ok {
 			f.close()
+			// Keep old channel opens from reaching a new forward with this key.
+			f.waitForPendingOpens()
+			h.Lock()
+			if h.forwards[key] == f {
+				delete(h.forwards, key)
+			}
+			h.Unlock()
 			return response.Accept(nil)
 		}
 		return response.Reject(nil)
