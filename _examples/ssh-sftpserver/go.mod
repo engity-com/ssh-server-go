@@ -6,7 +6,7 @@ replace github.com/engity-com/ssh-server-go => ../..
 
 require (
 	github.com/engity-com/ssh-server-go v0.0.0
-	github.com/pkg/sftp v1.13.11
+	github.com/pkg/sftp v1.13.12
 )
 
 require (
