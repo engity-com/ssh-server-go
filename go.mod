@@ -8,7 +8,7 @@ require (
 	github.com/pires/go-proxyproto v0.16.0
 	github.com/stretchr/testify v1.12.1
 	golang.org/x/crypto v0.58.0
-	golang.org/x/sys v0.49.0
+	golang.org/x/sys v0.50.0
 )
 
 require go.yaml.in/yaml/v3 v3.0.5 // indirect
