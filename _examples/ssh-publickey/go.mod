@@ -6,7 +6,7 @@ replace github.com/engity-com/ssh-server-go => ../..
 
 require (
 	github.com/engity-com/ssh-server-go v0.0.0
-	golang.org/x/crypto v0.58.0
+	golang.org/x/crypto v0.59.0
 )
 
 require (
