@@ -7,7 +7,7 @@ require (
 	github.com/echocat/slf4g v1.9.0
 	github.com/pires/go-proxyproto v0.16.0
 	github.com/stretchr/testify v1.12.1
-	golang.org/x/crypto v0.58.0
+	golang.org/x/crypto v0.59.0
 	golang.org/x/sys v0.50.0
 )
 
