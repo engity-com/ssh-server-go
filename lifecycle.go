@@ -113,6 +113,7 @@ func (s *serveContext) trackConnection(conn net.Conn) *activeConn {
 	// control never depend on it.
 	if dropRate >= 100 || dropRate > 0 && int(rand.UintN(100)) < dropRate { // #nosec G404
 		s.mu.Unlock()
+		s.onLimitRejected(s.parent, LimitRejectionMaxStartups)
 		closeQuietly(conn)
 		return nil
 	}
