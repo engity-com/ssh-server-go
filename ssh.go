@@ -139,6 +139,18 @@ type ConnectionFailedCallback func(ctx Context, conn net.Conn, err error) error
 // callback are not recovered.
 type DisconnectCallback func(ctx Context, conn net.Conn) error
 
+// LimitRejectedCallback observes a protection-limit rejection. It receives only
+// the rejecting limit, without connection metadata or error text. A returned
+// error is reported synchronously to ErrorHandler with ErrorOperationHandle and
+// the rejected resource's ErrorScope. No client response is available, and
+// ErrorHandler results cannot change the rejection or close the SSH connection.
+// Errors left unhandled are logged, not returned from Serve or HandleConn.
+//
+// Calls run synchronously outside internal locks and may be concurrent. The
+// callback must be concurrency-safe and must not block. No additional goroutine
+// is started for it.
+type LimitRejectedCallback func(reason LimitRejectionReason) error
+
 // Window represents the informational dimensions of a PTY window. Width and
 // Height are measured in characters; WidthPixels and HeightPixels describe the
 // drawable area. A zero value in an initial PTY request means unspecified. A

@@ -241,6 +241,16 @@ type Server struct {
 	ConnectionFailedCallback ConnectionFailedCallback // callback to report connection failures
 	DisconnectCallback       DisconnectCallback       // callback after an established SSH connection ends
 	ErrorHandler             ErrorHandler             // central callback for operational server and handler errors
+	// LimitRejectedCallback observes each operation rejected by a protection limit
+	// exactly once, with only the first limit that rejects it. It receives no
+	// connection metadata or error text and cannot change the decision or SSH
+	// response. Returned errors are reported to ErrorHandler without changing
+	// protection decisions or SSH replies. Nil preserves the default behavior.
+	//
+	// It runs synchronously, outside internal locks, without an additional
+	// goroutine. Calls may be concurrent; the callback must be concurrency-safe
+	// and must not block.
+	LimitRejectedCallback LimitRejectedCallback
 	// GracefulShutdownHandler determines how long a context-triggered shutdown
 	// waits for connections to drain before closing them. It is called once with
 	// the original canceled context after the listener has been closed and must
@@ -989,9 +999,17 @@ func (srv *Server) handleConn(parent context.Context, newConn net.Conn, active *
 	}))
 	applyConnMetadata(ctx, sshConn)
 	publishAuthPermissions(ctx, sshConn.Permissions)
+	var notifyLimitRejected func(LimitRejectionReason)
+	if srv.LimitRejectedCallback != nil {
+		notifyLimitRejected = func(reason LimitRejectionReason) {
+			scope.onLimitRejected(ctx, reason)
+		}
+	}
 	connectionLimiter := resourceLimiter{
-		limit:  int64(configuredLimit(srv.MaxConnections, DefaultMaxConnections)),
-		active: &scope.authenticatedConnections,
+		limit:      int64(configuredLimit(srv.MaxConnections, DefaultMaxConnections)),
+		active:     &scope.authenticatedConnections,
+		reason:     LimitRejectionMaxConnections,
+		onRejected: notifyLimitRejected,
 	}
 	connectionReserved := connectionLimiter.reserve()
 	defer func() {
@@ -1035,18 +1053,24 @@ func (srv *Server) handleConn(parent context.Context, newConn net.Conn, active *
 	globalChannelLimiter := &resourceLimiter{
 		limit:  int64(configuredLimit(srv.MaxChannels, DefaultMaxChannels)),
 		active: &scope.globalChannels,
+		reason: LimitRejectionMaxChannels,
 	}
-	channelLimiter := &connectionChannelLimiter{limit: int64(maxChannels), global: globalChannelLimiter}
+	channelLimiter := &connectionChannelLimiter{
+		limit: int64(maxChannels), global: globalChannelLimiter, onRejected: notifyLimitRejected,
+	}
 	ctx.SetValue(contextKeyChannelLimiter, channelLimiter)
 	var activeReverseForwards atomic.Int64
 	globalForwardLimiter := &resourceLimiter{
 		limit:  int64(configuredLimit(srv.MaxReverseForwards, DefaultMaxReverseForwards)),
 		active: &scope.globalReverseForwards,
+		reason: LimitRejectionMaxReverseForwards,
 	}
 	forwardLimiter := &resourceLimiter{
-		limit:  int64(configuredLimit(srv.MaxReverseForwardsPerConnection, DefaultMaxReverseForwardsPerConnection)),
-		active: &activeReverseForwards,
-		parent: globalForwardLimiter,
+		limit:      int64(configuredLimit(srv.MaxReverseForwardsPerConnection, DefaultMaxReverseForwardsPerConnection)),
+		active:     &activeReverseForwards,
+		parent:     globalForwardLimiter,
+		reason:     LimitRejectionMaxReverseForwardsPerConnection,
+		onRejected: notifyLimitRejected,
 	}
 	ctx.SetValue(contextKeyForwardLimiter, forwardLimiter)
 	workers := &connectionWorkers{}
@@ -1074,6 +1098,7 @@ func (srv *Server) handleConn(parent context.Context, newConn net.Conn, active *
 		if !sessionReserved {
 			activeSessions.Add(-1)
 			channelLimiter.release()
+			scope.onLimitRejected(ctx, LimitRejectionMaxSessionsPerConnection)
 			_ = ch.Reject(gossh.ResourceShortage, "too many open sessions")
 			continue
 		}
@@ -1170,9 +1195,10 @@ func serverConfigHasClientAuth(config *gossh.ServerConfig) bool {
 }
 
 type connectionChannelLimiter struct {
-	limit  int64
-	active atomic.Int64
-	global *resourceLimiter
+	limit      int64
+	active     atomic.Int64
+	global     *resourceLimiter
+	onRejected func(LimitRejectionReason)
 }
 
 func (l *connectionChannelLimiter) reserve() bool {
@@ -1181,11 +1207,17 @@ func (l *connectionChannelLimiter) reserve() bool {
 	}
 	if l.limit > 0 && l.active.Add(1) > l.limit {
 		l.active.Add(-1)
+		if l.onRejected != nil {
+			l.onRejected(LimitRejectionMaxChannelsPerConnection)
+		}
 		return false
 	}
-	if l.global != nil && !l.global.reserve() {
+	if reserved, reason := l.global.tryReserve(); !reserved {
 		if l.limit > 0 {
 			l.active.Add(-1)
+		}
+		if l.onRejected != nil {
+			l.onRejected(reason)
 		}
 		return false
 	}
@@ -1202,30 +1234,42 @@ func (l *connectionChannelLimiter) release() {
 }
 
 type resourceLimiter struct {
-	limit  int64
-	active *atomic.Int64
-	parent *resourceLimiter
+	limit      int64
+	active     *atomic.Int64
+	parent     *resourceLimiter
+	reason     LimitRejectionReason
+	onRejected func(LimitRejectionReason)
 }
 
 func (l *resourceLimiter) reserve() bool {
+	reserved, reason := l.tryReserve()
+	if !reserved && l.onRejected != nil {
+		l.onRejected(reason)
+	}
+	return reserved
+}
+
+// tryReserve rolls back all partial reservations before the caller notifies
+// observers. Parent failures are reported only by the outermost reserve call.
+func (l *resourceLimiter) tryReserve() (bool, LimitRejectionReason) {
 	if l == nil {
-		return true
+		return true, 0
 	}
 	localReserved := false
 	if l.limit > 0 && l.active != nil {
 		if l.active.Add(1) > l.limit {
 			l.active.Add(-1)
-			return false
+			return false, l.reason
 		}
 		localReserved = true
 	}
-	if l.parent != nil && !l.parent.reserve() {
+	if reserved, reason := l.parent.tryReserve(); !reserved {
 		if localReserved {
 			l.active.Add(-1)
 		}
-		return false
+		return false, reason
 	}
-	return true
+	return true, 0
 }
 
 func (l *resourceLimiter) release() {
