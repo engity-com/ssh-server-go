@@ -60,7 +60,7 @@ jobs:
           persist-credentials: false
 
       - name: Install MISE
-        uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
+        uses: jdx/mise-action@90f833d396d0cc3674b631d2d225e306476c303a # v5.2.10
 
       - name: Install dependencies
         run: mise run install:go
@@ -79,7 +79,7 @@ jobs:
           persist-credentials: false
 
       - name: Install MISE
-        uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
+        uses: jdx/mise-action@90f833d396d0cc3674b631d2d225e306476c303a # v5.2.10
 
       - name: Install dependencies
         run: mise run install:go
@@ -112,7 +112,7 @@ jobs:
           persist-credentials: false
 
       - name: Install MISE
-        uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
+        uses: jdx/mise-action@90f833d396d0cc3674b631d2d225e306476c303a # v5.2.10
 
       - name: Compile example
         working-directory: _examples/${{ matrix.example }}
@@ -132,7 +132,7 @@ jobs:
           persist-credentials: false
 
       - name: Install MISE
-        uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
+        uses: jdx/mise-action@90f833d396d0cc3674b631d2d225e306476c303a # v5.2.10
 
       - name: Install Go dependencies
         run: mise run install:go
